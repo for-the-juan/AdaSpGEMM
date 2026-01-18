@@ -6,7 +6,7 @@ MAT_VAL_TYPE = double
 VALUE_TYPE = double
 
 #CUDA_PARAMETERS
-NVCC_FLAGS = -O3 -w -arch=compute_61 -code=sm_80 -gencode=arch=compute_61,code=sm_80 -std=c++17
+NVCC_FLAGS = -O3 -w -gencode=arch=compute_80,code=sm_80 -std=c++17
 #-gencode=arch=compute_61,code=sm_75
 # -m64 -Xptxas -dlcm=cg -gencode=arch=compute_61,code=sm_61 -gencode=arch=compute_61,code=compute_61
 #-Xcompiler -Wall -D_FORCE_INLINES -DVERBOSE --expt-extended-lambda -use_fast_math --expt-relaxed-constexpr

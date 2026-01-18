@@ -1,8 +1,9 @@
 #include "common.h"
 #include "utils.h"
-// #define _CG_ABI_EXPERIMENTAL
-// #include <cooperative_groups.h>
-// namespace cg = cooperative_groups;
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+#include <cooperative_groups/scan.h>
+namespace cg = cooperative_groups;
 
 // template <int N>
 // __forceinline__ __device__ cg::thread_block_tile<N> createTileGroup() {    
@@ -35,6 +36,15 @@ __forceinline__ __device__ int sum_16_shfl(int sum)
     for (int mask = 1; mask < HALFWARP_SIZE; mask <<= 1)
         sum += __shfl_xor_sync(-1, sum, mask);
 
+    return sum;
+}
+
+__forceinline__ __device__ int sum_16_shfl_cg(int sum)
+{
+    auto g = cg::tiled_partition<16>(cg::this_thread_block());
+
+    sum = cg::reduce(g, sum, cg::plus<int>());
+    
     return sum;
 }
 
@@ -527,6 +537,8 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_quadwarp(const int *d_blkro
 
     int tile_end = tile_start + TILE_PER_QUADWARP; //(global_warp_id + 1) * TPW;
 
+    auto g8 = cg::tiled_partition<8>(cg::this_thread_block());
+
     if (!quadwarp_lane_id)
     {
         s_blksmem_tny_cnt_local[0] = 0;
@@ -571,6 +583,7 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_quadwarp(const int *d_blkro
                                                  s_matched_posa_local, s_matched_posb_local,
                                                  SPECULATIVE_INTERSECTION, s_matchedcnt_local,
                                                  quadwarp_lane_id, QUADWARP_SIZE);
+                g8.sync();
                 matchedcnt = s_matchedcnt_local[0];
 
                 if (matchedcnt == 0)
@@ -890,6 +903,8 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_halfwarp(const int *d_blkro
 
     int tile_end = tile_start + TILE_PER_HALFWARP; //(global_warp_id + 1) * TPW;
 
+    auto g16 = cg::tiled_partition<16>(cg::this_thread_block());
+
     if (!halfwarp_lane_id)
     {
         s_blksmem_tny_cnt_local[0] = 0;
@@ -934,6 +949,7 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_halfwarp(const int *d_blkro
                                                  s_matched_posa_local, s_matched_posb_local,
                                                  SPECULATIVE_INTERSECTION, s_matchedcnt_local,
                                                  halfwarp_lane_id, HALFWARP_SIZE);
+                g16.sync();
                 matchedcnt = s_matchedcnt_local[0];
 
                 if (matchedcnt == 0)
@@ -1081,7 +1097,7 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_halfwarp(const int *d_blkro
             }
         }
 
-        int nnzcnt_sum = sum_16_shfl(nnzcnt);
+        int nnzcnt_sum = sum_16_shfl_cg(nnzcnt);
 
         int nnzcnt_scan = scan_32_shfl(nnzcnt, lane_id);
 
@@ -1254,6 +1270,8 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_warp(const int *d_blkrowptr
 
     int tile_end = tile_start + TILE_PER_WARP; //(global_warp_id + 1) * TPW;
 
+    auto g32 = cg::tiled_partition<32>(cg::this_thread_block());
+
     if (!warp_lane_id)
     {
         s_blksmem_tny_cnt_local[0] = 0;
@@ -1301,6 +1319,7 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_warp(const int *d_blkrowptr
                                                  s_matched_posa_local, s_matched_posb_local,
                                                  SPECULATIVE_INTERSECTION, s_matchedcnt_local,
                                                  warp_lane_id, WARP_SIZE);
+                g32.sync();
                 matchedcnt = s_matchedcnt_local[0];
 
                 if (matchedcnt == 0)
@@ -1776,7 +1795,7 @@ __global__ void tile_spgemm_step3_cuda_kernel_dns_halfwarp(const int *d_blkrowpt
         int nnzcnt_scan[25] = {};
 #pragma unroll
         for (int temp = 0; temp < (TILE_SIZE_M + HALFWARP_SIZE - 1) / HALFWARP_SIZE; temp++){
-            nnzcnt_sum_[temp] = sum_16_shfl(nnzcnt[temp]);
+            nnzcnt_sum_[temp] = sum_16_shfl_cg(nnzcnt[temp]);
             nnzcnt_scan[temp] = scan_32_shfl(nnzcnt[temp], lane_id);
             nnzcnt_scan[temp] -= nnzcnt[temp];
             nnzcnt_scan[temp] -= __shfl_sync(0xffffffff, nnzcnt_scan[temp], (lane_id >> 4) << 4);
@@ -1958,6 +1977,8 @@ __global__ void tile_spgemm_step4_cuda_sparse_kernel_adaptive_warp(int *d_blkrow
     const int warp_lane_id = (WARP_SIZE - 1) & threadIdx.x;
     const int c_tile_lane_id = (THREADS_USED - 1) & threadIdx.x;
 
+    auto g = cg::tiled_partition<THREADS_USED>(cg::this_thread_block());
+
     // Initial the value of matrix C, not to change
     for (int i = c_tile_lane_id; i < blknnzctotal; i += THREADS_USED){
         d_blkcsr_Val_C[nnzcstart + i] = 0.0;
@@ -2022,6 +2043,7 @@ __global__ void tile_spgemm_step4_cuda_sparse_kernel_adaptive_warp(int *d_blkrow
                                                    s_matched_posa_local, s_matched_posb_local,
                                                    SPECULATIVE_INTERSECTION, s_matchedcnt_local,
                                                    c_tile_lane_id, THREADS_USED);
+        g.sync();
                                                 //    warp_lane_id, WARP_SIZE);
 
         // #if (THREADS_USED > 32)
@@ -2329,6 +2351,8 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp(int *d_blkrowptr
         }
     }
 
+    auto g = cg::tiled_partition<THREADS_USED>(cg::this_thread_block());
+
     if (!c_tile_lane_id)
         s_matchedcnt_local[0] = 0;
 
@@ -2358,7 +2382,8 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp(int *d_blkrowptr
                                                    s_matched_posa_local, s_matched_posb_local,
                                                    SPECULATIVE_INTERSECTION, s_matchedcnt_local,
                                                    c_tile_lane_id, THREADS_USED);
-
+        
+        g.sync();
         matchedcnt = s_matchedcnt_local[0];
     }
 

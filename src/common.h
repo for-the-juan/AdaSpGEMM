@@ -19,6 +19,8 @@
 
 #include "utils.h"
 
+#define USE_NSPRASE 1
+
 #ifndef MAT_VAL_TYPE
 #define MAT_VAL_TYPE double
 #endif

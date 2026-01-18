@@ -773,7 +773,8 @@ int *d_crow,
                             //__syncwarp();
         }
     }//__syncwarp();
-  
+    __syncthreads();
+    
     for (j = tid; j < (B_PWMIN); j += PWARP) {//__syncwarp();
         if (shared_check[soffset + j] != -1) {
             index = atomicAdd(d_nz + rid, 1);//__syncwarp();
