@@ -229,10 +229,11 @@ void step3_kernel(SMatrixA *matrix, int nnz_max, int tilecnt_max, int tile_size_
     TILE_CSR_COL_TYPE_A *tile_csr_Col = matrix->tile_csr_Col;
     TILE_CSR_PTR_TYPE *tile_csr_Ptr = matrix->tile_csr_Ptr;
 
+    MAT_VAL_TYPE *dense_data = matrix->dense_data; 
+
     TILE_MASK_TYPE_A *mask = matrix->mask;
 
     unsigned thread = omp_get_max_threads();
-    // unsigned thread = matrix->nthreads;
 
     TILE_CSR_COL_TYPE_A *csr_colidx_temp_g = (TILE_CSR_COL_TYPE_A *)malloc((thread * nnz_max) * sizeof(TILE_CSR_COL_TYPE_A));
     MAT_VAL_TYPE *csr_val_temp_g = (MAT_VAL_TYPE *)malloc((thread * nnz_max) * sizeof(MAT_VAL_TYPE));
@@ -253,20 +254,33 @@ void step3_kernel(SMatrixA *matrix, int nnz_max, int tilecnt_max, int tile_size_
         int start = blki * tile_size_m;
         int end = blki == tilem - 1 ? m : (blki + 1) * tile_size_m;
 
-        for (int blkj = rowpointer[start]; blkj < rowpointer[end]; blkj++)
+        for (int ri = 0; ri < rowlen; ri++)
         {
-            int jc_temp = columnidx[blkj] / tile_size_n;
-            for (int bi = 0; bi < tilenum_per_row; bi++)
+            int current_row = start + ri;
+            for (int blkj = rowpointer[current_row]; blkj < rowpointer[current_row + 1]; blkj++)
             {
-                int tile_id = tile_ptr[blki] + bi;
-                int jc = tile_columnidx[tile_id];
-                int pre_nnz = tile_nnz[tile_id] - tile_nnz[tile_ptr[blki]];
-                if (jc == jc_temp)
+                int jc_temp = columnidx[blkj] / tile_size_n;
+                for (int bi = 0; bi < tilenum_per_row; bi++)
                 {
-                    csr_val_temp[pre_nnz + tile_count[bi]] = value[blkj];
-                    csr_colidx_temp[pre_nnz + tile_count[bi]] = columnidx[blkj] - jc * tile_size_n;
-                    tile_count[bi]++;
-                    break;
+                    int tile_id = tile_ptr[blki] + bi;
+                    int jc = tile_columnidx[tile_id];
+                    int pre_nnz = tile_nnz[tile_id] - tile_nnz[tile_ptr[blki]];
+                    if (jc == jc_temp)
+                    {
+                        csr_val_temp[pre_nnz + tile_count[bi]] = value[blkj];
+                        csr_colidx_temp[pre_nnz + tile_count[bi]] = columnidx[blkj] - jc * tile_size_n;
+
+                        // ri is the local row index (0 to tile_size_m-1)
+                        // col_in_tile is the local col index (0 to tile_size_n-1)
+                        int col_in_tile = columnidx[blkj] - jc * tile_size_n;
+                        
+                        long long tile_offset = (long long)tile_id * tile_size_m * tile_size_n;
+                        long long internal_offset = (long long)ri * tile_size_n + col_in_tile;
+                        
+                        dense_data[tile_offset + internal_offset] = value[blkj];
+                        tile_count[bi]++;
+                        break;
+                    }
                 }
             }
         }
@@ -287,7 +301,7 @@ void step3_kernel(SMatrixA *matrix, int nnz_max, int tilecnt_max, int tile_size_
                     TILE_CSR_COL_TYPE_A colidx = csr_colidx_temp[pre_nnz + k];
                     tile_csr_Val[offset + k] = csr_val_temp[pre_nnz + k];
 
-                    tile_csr_Col[offset + k] = (ri * tile_size_n) + colidx;  // FIXED: use tile_size_n for columns
+                    tile_csr_Col[offset + k] = (ri * tile_size_n) + colidx;
                     assert((tile_size_n % MaskBitsA)==0);
                     int stride = colidx / MaskBitsA;
                     mask[tile_id * tile_size_m * tile_size_n / MaskBitsA + ri * tile_size_n / MaskBitsA + stride] |= (0x1ULL << (MaskBitsA - colidx % MaskBitsA - 1));
@@ -403,6 +417,13 @@ void csr2tile_row_major(SMatrixA *matrix, int tile_size_m, int tile_size_n)
 
     matrix->numtile = matrix->tile_ptr[matrix->tilem];
 
+    // Dense format
+    matrix->dense_data = (MAT_VAL_TYPE *)malloc(matrix->numtile * tile_size_m * tile_size_n * sizeof(MAT_VAL_TYPE));
+    memset(matrix->dense_data, 0, matrix->numtile * tile_size_m * tile_size_n * sizeof(MAT_VAL_TYPE));
+
+    matrix->has_dense_calculated = (bool *)malloc(matrix->numtile * sizeof(bool));
+    memset(matrix->has_dense_calculated, 0, matrix->numtile * sizeof(bool));
+
     matrix->tile_columnidx = (int *)malloc(matrix->numtile * sizeof(int));
     memset(matrix->tile_columnidx, 0, matrix->numtile * sizeof(int));
 
@@ -515,6 +536,13 @@ void csr2tile_col_major(SMatrixB *matrix, int tile_size_m, int tile_size_n)
     memset(matrix->tile_columnidx, 0, matrix->numtile * sizeof(int));
     matrix->tile_rowidx = (int *)malloc(matrix->numtile * sizeof(int));
     memset(matrix->tile_rowidx, 0, matrix->numtile * sizeof(int));
+
+    // Dense format
+    matrix->dense_data = (MAT_VAL_TYPE *)malloc(matrix->numtile * tile_size_m * tile_size_n * sizeof(MAT_VAL_TYPE));
+    memset(matrix->dense_data, 0, matrix->numtile * tile_size_m * tile_size_n * sizeof(MAT_VAL_TYPE));
+
+    matrix->has_dense_calculated = (bool *)malloc(matrix->numtile * sizeof(bool));
+    memset(matrix->has_dense_calculated, 0, matrix->numtile * sizeof(bool));
 
     matrix->csc_tile_ptr = BT->tile_ptr;
     matrix->csc_tile_rowidx = BT->tile_columnidx;
@@ -642,11 +670,23 @@ void csr2tile_col_major(SMatrixB *matrix, int tile_size_m, int tile_size_n)
                 for (int k = subrowmatrixB[bi].rowpointer[bri]; k < subrowmatrixB[bi].rowpointer[bri + 1]; k++)
                 {
                     int colidx = subrowmatrixB[bi].columnindex[k];
-                    matrix->tile_csr_Value[prennz + k] = subrowmatrixB[bi].value[k];
+                    MAT_VAL_TYPE val = subrowmatrixB[bi].value[k];
+                    matrix->tile_csr_Value[prennz + k] = val;
                     assert((tile_size_m % MaskBitsB) == 0);
                     int stride = colidx / MaskBitsB;
                     matrix->mask[tileid * tile_size_n * (tile_size_m / MaskBitsB) + bri * (tile_size_m / MaskBitsB) + stride] |= (0x1ULL << (MaskBitsB - colidx % MaskBitsB - 1));
                     matrix->tile_csr_Col[prennz + k] = colidx;
+
+                    // bri is the row index in the tile
+                    // colidx is the column index in the tile
+                    // Calculate pointer to this tile's dense block
+                    long long tile_offset = (long long)tileid * tile_size_n * tile_size_m;
+                    
+                    // IMPORTANT: subrowmatrixB is transposed B, so logic follows row-major of the TILE.
+                    // The tile dimensions for B are typically [tile_size_n][tile_size_m] in this context.
+                    long long internal_offset = bri * tile_size_m + colidx; 
+
+                    matrix->dense_data[tile_offset + internal_offset] = val;
                 }
                 matrix->tile_csr_Ptr[tileid * tile_size_n + bri] = subrowmatrixB[bi].rowpointer[bri];
             }
@@ -689,6 +729,11 @@ void matrix_destroy(SMatrixA *matrix)
     free(matrix->tile_csr_Col);
     free(matrix->tile_csr_Ptr);
     free(matrix->mask);
+    if (matrix->dense_data != NULL)
+    {
+        free(matrix->dense_data);
+        matrix->dense_data = NULL;
+    }
 }
 
 void matrix_destroy_B(SMatrixB *matrix)
@@ -700,4 +745,9 @@ void matrix_destroy_B(SMatrixB *matrix)
     free(matrix->tile_csr_Col);
     free(matrix->tile_csr_Ptr);
     free(matrix->mask);
+    if (matrix->dense_data != NULL)
+    {
+        free(matrix->dense_data);
+        matrix->dense_data = NULL;
+    }
 }

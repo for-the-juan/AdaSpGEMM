@@ -21,6 +21,8 @@
 //#include <nsparse.h>
 #include "nsparse_asm.h"
 #include "utils_cuda_scan.h"
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
 
 /* SpGEMM Specific Parameters */
 #define HASH_SCAL 107 // Set disjoint number to COMP_SH_SIZE
@@ -336,6 +338,7 @@ __global__ void set_row_nz_bin_pwarp(const int *d_arpt, const int *d_acol,
                                      int bin_offset, int M) {
   
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    auto g4 = cg::tiled_partition<4>(cg::this_thread_block());
     int rid = i / PWARP;
     int tid = i % PWARP;
     int local_rid = rid % (blockDim.x / PWARP);
@@ -350,6 +353,7 @@ __global__ void set_row_nz_bin_pwarp(const int *d_arpt, const int *d_acol,
     for (j = tid; j < IMB_PWMIN; j += PWARP) {
         check[soffset + j] = -1;
     }//__syncwarp();
+    // g4.sync();
     if (rid >= M) {
         return;
     }
@@ -692,15 +696,13 @@ void set_row_nnz(int *d_arpt, int *d_acol,
                  sfBIN *bin,
                  int M, int *nnz);
   
-
 __global__ void calculate_value_col_bin_pwarp(const int *d_arpt,
                                               const int *d_acol,
                                               const real *d_aval,
                                               const int* __restrict__ d_brpt,
                                               const int* __restrict__ d_bcol,
                                               const real* __restrict__ d_bval,
-                                              int *d_crpt,
-int *d_crow, 
+                                              int *d_crpt, int *d_crow, 
                                               int *d_ccol,
                                               real *d_cval,
                                               const int *d_row_perm,
@@ -709,6 +711,7 @@ int *d_crow,
                                               int bin_size) {
   
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // auto g4 = cg::tiled_partition<PWARP>(cg::this_thread_block());
     int rid = i / PWARP;
     int tid = i % PWARP;
     int local_rid = rid % (blockDim.x / PWARP);
@@ -741,7 +744,6 @@ int *d_crow,
     int offset = d_crpt[rid];
     int old, index;
 //    real aval, bval;
-
     for (j = d_arpt[rid] + tid; j < d_arpt[rid + 1]; j += PWARP) {//__syncwarp();
         acol = ld_gbl_int32(d_acol + j);//__syncwarp();
 //        aval = ld_gbl_real(d_aval + j);
@@ -773,7 +775,8 @@ int *d_crow,
                             //__syncwarp();
         }
     }//__syncwarp();
-  
+    __syncthreads();
+
     for (j = tid; j < (B_PWMIN); j += PWARP) {//__syncwarp();
         if (shared_check[soffset + j] != -1) {
             index = atomicAdd(d_nz + rid, 1);//__syncwarp();
@@ -793,7 +796,7 @@ int *d_crow,
             count += (unsigned int)(shared_check[soffset + k] - target) >> 31;//__syncwarp();
         }
         //__syncwarp();
-d_crow[offset + count] = rid;//__syncwarp();
+        d_crow[offset + count] = rid;//__syncwarp();
         d_ccol[offset + count] = shared_check[soffset + j];//__syncwarp();
 //        d_cval[offset + count] = shared_value[soffset + j];
 

@@ -179,6 +179,13 @@ double csr_mem = CSR_bytes /1024/1024;
 
 printf("tile space overhead = %.2f MB\n", mem);
 
+double dense_bytes = (long long int)matrixA->numtile * TILE_SIZE_M * TILE_SIZE_N * sizeof(MAT_VAL_TYPE) + 
+                     (long long int)matrixA->numtile * TILE_SIZE_M * TILE_SIZE_N * sizeof(bool);
+double dense_mem = dense_bytes /1024/1024;
+
+printf("CSR space overhead = %.2f MB\n", csr_mem);
+printf("Dense space overhead = %.2f MB\n", dense_mem);
+
 #endif
 
         csr2tile_col_major(matrixB, TILE_SIZE_M, TILE_SIZE_N);

@@ -15,6 +15,7 @@ mkdir -p ./TileSpGEMMlog
 
 for mtx_file in "$AA"/*.mtx; do
     base_name_=$(basename $mtx_file .mtx)
-    /home/stu1/TileSpGEMM/src/test -d 0 -aat 0 $mtx_file > TileSpGEMMlog/${base_name_}.log
+    # /home/stu1/TileSpGEMM/src/test -d 0 -aat 0 $mtx_file > TileSpGEMMlog/${base_name_}.log
+    /home/stu1/chenruiyang/TileSpGEMM/src/test -d 0 -aat 0 $mtx_file > TileSpGEMMlog/${base_name_}.log
     echo "${base_name_} Finished!"
 done

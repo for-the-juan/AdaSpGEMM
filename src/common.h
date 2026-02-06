@@ -29,12 +29,17 @@
 
 // e.g., nvcc -DTILE_SIZE_M=64 ...
 #ifndef TILE_SIZE_M
-#define TILE_SIZE_M 16
+#define TILE_SIZE_M 8
 #endif
 
 #ifndef TILE_SIZE_N
-#define TILE_SIZE_N 16
+#define TILE_SIZE_N 8
 #endif
+
+// WMMA fragment dimensions for Double Precision (FP64)
+#define WMMA_M 8
+#define WMMA_N 8
+#define WMMA_K 4
 
 #define QUADWARP_SIZE 8
 #define HALFWARP_SIZE 16
@@ -58,6 +63,7 @@
 #define WARP_PER_BLOCK 4
 
 #define USE_HALFWARP 1
+#define USE_TENSORCORE 1
 
 // #if TILE_SIZE_M <= 256
 //     #define TILE_PER_WARP (16 * 16 / TILE_SIZE_M) // should not be larger than WARPSIZE
@@ -150,7 +156,7 @@
 #define THREADS_USED_TNY_TH 16
 #define THREADS_USED_SML_TH 16
 #define THREADS_USED_LRG_TH 32
-#define THREADS_USED_DNS_TH TILE_SIZE_M
+#define THREADS_USED_DNS_TH 32
 
 // MAGIC_NUMBER should be a prime
 #define MAGIC_NUMBER 13
@@ -225,13 +231,15 @@ typedef struct
     int *tile_columnidx;
     int *tile_rowidx;
     int *tile_nnz;
-    int numtile;  //非零tile数
+    int numtile;
     MAT_VAL_TYPE *tile_csr_Value;
     TILE_CSR_COL_TYPE_A *tile_csr_Col;
     TILE_CSR_PTR_TYPE *tile_csr_Ptr;
-    TILE_MASK_TYPE_A *mask;  // 动态分配的掩码数组
+    TILE_MASK_TYPE_A *mask;
     int *csc_tile_ptr;
     int *csc_tile_rowidx;
+    MAT_VAL_TYPE *dense_data;
+    bool *has_dense_calculated;
 }SMatrixA;
 
 // Matrix C also uses SMatrixB, since they share the same TILE_CSR_COL_TYPE and TILE_MASK_TYPE
@@ -254,8 +262,10 @@ typedef struct
     MAT_VAL_TYPE *tile_csr_Value;
     TILE_CSR_COL_TYPE_B *tile_csr_Col;
     TILE_CSR_PTR_TYPE *tile_csr_Ptr;
-    TILE_MASK_TYPE_B *mask;  // 动态分配的掩码数组
+    TILE_MASK_TYPE_B *mask;
     int *csc_tile_ptr;
     int *csc_tile_rowidx;
+    MAT_VAL_TYPE *dense_data;
+    bool *has_dense_calculated;
 }SMatrixB;
 #endif

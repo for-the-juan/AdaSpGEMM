@@ -1,13 +1,16 @@
 #include "common.h"
 #include "utils.h"
+#include <cuda_fp16.h>
+#include <mma.h> // Required for nvcuda namespace
+#include <cuda.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cooperative_groups/scan.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <mma.h>
 using namespace nvcuda;
 namespace cg = cooperative_groups;
+// #define _CG_ABI_EXPERIMENTAL
+// #include <cooperative_groups.h>
+// namespace cg = cooperative_groups;
 
 // template <int N>
 // __forceinline__ __device__ cg::thread_block_tile<N> createTileGroup() {    
@@ -40,15 +43,6 @@ __forceinline__ __device__ int sum_16_shfl(int sum)
     for (int mask = 1; mask < HALFWARP_SIZE; mask <<= 1)
         sum += __shfl_xor_sync(-1, sum, mask);
 
-    return sum;
-}
-
-__forceinline__ __device__ int sum_16_shfl_cg(int sum)
-{
-    auto g = cg::tiled_partition<16>(cg::this_thread_block());
-
-    sum = cg::reduce(g, sum, cg::plus<int>());
-    
     return sum;
 }
 
@@ -353,8 +347,13 @@ __global__ void tile_spgemm_step1_cuda_spa_kernel(int *d_blkrowptrA, int *d_blkc
     const int lane_id = threadIdx.x % WARP_SIZE;
     unsigned int *bitmask_local = &bitmask[local_warp_id * SPA_INT_PER_WARP];
 
-    for (int i = lane_id; i < nmasks; i += WARP_SIZE)
+    cg::thread_block tb = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(tb);
+
+    for (int i = warp.thread_rank(); i < nmasks; i += warp.size())
         bitmask_local[i] = 0;
+
+    tb.sync();
 
     int astart = d_blkrowptrA[global_warp_id];
     int astop = d_blkrowptrA[global_warp_id + 1];
@@ -363,42 +362,48 @@ __global__ void tile_spgemm_step1_cuda_spa_kernel(int *d_blkrowptrA, int *d_blkc
         int rowidx = d_blkcolidxA[i];
         int bstart = d_blkrowptrB[rowidx];
         int bstop = d_blkrowptrB[rowidx + 1];
-        for (int j = bstart + lane_id; j < bstop; j += WARP_SIZE)
+        for (int j = bstart + warp.thread_rank(); j < bstop; j += warp.size())
         {
             int colidx = d_blkcolidxB[j];
             unsigned int mask = 1 << (31 - colidx % 32);
             atomicOr(&bitmask_local[colidx / 32], mask);
         }
     }
+
+    tb.sync();
     //__syncthreads();
 
     int cnt = 0;
-    for (int i = lane_id; i < nmasks; i += WARP_SIZE)
+    for (int i = warp.thread_rank(); i < nmasks; i += warp.size())
         cnt += __popc(bitmask_local[i]);
-    cnt = sum_32_shfl(cnt);
 
-    if (!lane_id){
-        d_blkrowptrC[global_warp_id] = cnt;
+    int total_cnt = cg::reduce(warp, cnt, cg::plus<int>());
+
+    if (warp.thread_rank() == 0){
+        d_blkrowptrC[global_warp_id] = total_cnt;
     }
 }
 
-__global__ void tile_spgemm_step1_numeric_cuda_spa_kernel(int *d_blkrowptrA, int *d_blkcolidxA, int blkmA,
-                                                          int *d_blkrowptrB, int *d_blkcolidxB, int blknB,
-                                                          int *d_blkrowptrC, int *d_blkrowidxC, int *d_blkcolidxC,
-                                                          int *d_spec_intersection_cnt, int *d_spec_intersection_posa, int *d_spec_intersection_posb)
+__global__ void tile_spgemm_step1_numeric_cuda_spa_kernel_withbin(int *d_blkrowptrA, int *d_blkcolidxA, int blkmA,
+                                                                int *d_blkrowptrB, int *d_blkcolidxB, int blknB,
+                                                                int *d_blkrowptrC, int *d_blkrowidxC, int *d_blkcolidxC,
+                                                                int *d_spec_intersection_cnt, int *d_spec_intersection_posa, int *d_spec_intersection_posb)
 {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     const int global_warp_id = global_id >> 5; //global_id / WARP_SIZE;
-    __shared__ unsigned int bitmask[WARP_PER_BLOCK * SPA_INT_PER_WARP];
+    // __shared__ unsigned int bitmask[WARP_PER_BLOCK * SPA_INT_PER_WARP];
+    extern __shared__ unsigned int dynamic_shared_mem[];
 
     if (global_warp_id >= blkmA)
         return;
+
+    unsigned int *bitmask = dynamic_shared_mem;
 
     const int nmasks = ceil((float)blknB / (float)32);
     const int nmasks_warpwise = ceil((float)nmasks / (float)WARP_SIZE) * WARP_SIZE; // make sure shfl func works
     const int local_warp_id = threadIdx.x >> 5;                                     //global_id / WARP_SIZE;
     const int lane_id = threadIdx.x % WARP_SIZE;
-    unsigned int *bitmask_local = &bitmask[local_warp_id * SPA_INT_PER_WARP];
+    unsigned int *bitmask_local = &bitmask[local_warp_id * nmasks_warpwise];
 
     for (int i = lane_id; i < nmasks_warpwise; i += WARP_SIZE)
         bitmask_local[i] = 0;
@@ -438,6 +443,79 @@ __global__ void tile_spgemm_step1_numeric_cuda_spa_kernel(int *d_blkrowptrA, int
         cnt_scan -= cnt;
 
         // write to gmem
+        int localoff = 0;
+#pragma unroll
+        for (int biti = 0; biti < 32; biti++)
+        {
+            if ((maski >> (31 - biti)) & 0x1)
+            {
+                d_blkrowidxC[cbase + cnt_scan + localoff] = global_warp_id;
+                d_blkcolidxC[cbase + cnt_scan + localoff] = i * 32 + biti;
+                localoff++;
+            }
+        }
+    }
+}
+
+__global__ void tile_spgemm_step1_numeric_cuda_spa_kernel(int *d_blkrowptrA, int *d_blkcolidxA, int blkmA,
+                                                          int *d_blkrowptrB, int *d_blkcolidxB, int blknB,
+                                                          int *d_blkrowptrC, int *d_blkrowidxC, int *d_blkcolidxC,
+                                                          int *d_spec_intersection_cnt, int *d_spec_intersection_posa, int *d_spec_intersection_posb)
+{
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    const int global_warp_id = global_id >> 5; //global_id / WARP_SIZE;
+    __shared__ unsigned int bitmask[WARP_PER_BLOCK * SPA_INT_PER_WARP];
+
+    if (global_warp_id >= blkmA)
+        return;
+
+    const int nmasks = ceil((float)blknB / (float)32);
+    const int nmasks_warpwise = ceil((float)nmasks / (float)WARP_SIZE) * WARP_SIZE; // make sure shfl func works
+    const int local_warp_id = threadIdx.x >> 5;                                     //global_id / WARP_SIZE;
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    unsigned int *bitmask_local = &bitmask[local_warp_id * SPA_INT_PER_WARP];
+
+    cg::thread_block tb = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(tb);
+
+    for (int i = warp.thread_rank(); i < nmasks_warpwise; i += warp.size())
+        bitmask_local[i] = 0;
+
+    tb.sync();
+
+    int cbase = d_blkrowptrC[global_warp_id];
+
+    int astart = d_blkrowptrA[global_warp_id];
+    int astop = d_blkrowptrA[global_warp_id + 1];
+    for (int i = astart; i < astop; i++)
+    {
+        int rowidx = d_blkcolidxA[i];
+        int bstart = d_blkrowptrB[rowidx];
+        int bstop = d_blkrowptrB[rowidx + 1];
+        for (int j = bstart + warp.thread_rank(); j < bstop; j += warp.size())
+        {
+            int colidx = d_blkcolidxB[j];
+            unsigned int mask = 1 << (31 - colidx % 32);
+            atomicOr(&bitmask_local[colidx / 32], mask);
+        }
+    }
+
+    tb.sync();
+
+    int cnt = 0;
+    int offset = 0;
+    for (int i = warp.thread_rank(); i < nmasks_warpwise; i += warp.size()){
+        unsigned int maski = bitmask_local[i];
+        int cnt = __popc(maski);
+    
+        int cnt_scan = cg::inclusive_scan(warp, cnt, cg::plus<int>());
+        
+        cnt_scan += offset;
+        int warp_sum = warp.shfl(cnt_scan, warp.size() - 1);
+        offset += warp_sum;
+        cnt_scan -= cnt;
+        
+        // 写入全局内存
         int localoff = 0;
 #pragma unroll
         for (int biti = 0; biti < 32; biti++)
@@ -541,8 +619,6 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_quadwarp(const int *d_blkro
 
     int tile_end = tile_start + TILE_PER_QUADWARP; //(global_warp_id + 1) * TPW;
 
-    auto g8 = cg::tiled_partition<8>(cg::this_thread_block());
-
     if (!quadwarp_lane_id)
     {
         s_blksmem_tny_cnt_local[0] = 0;
@@ -587,7 +663,6 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_quadwarp(const int *d_blkro
                                                  s_matched_posa_local, s_matched_posb_local,
                                                  SPECULATIVE_INTERSECTION, s_matchedcnt_local,
                                                  quadwarp_lane_id, QUADWARP_SIZE);
-                g8.sync();
                 matchedcnt = s_matchedcnt_local[0];
 
                 if (matchedcnt == 0)
@@ -907,8 +982,6 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_halfwarp(const int *d_blkro
 
     int tile_end = tile_start + TILE_PER_HALFWARP; //(global_warp_id + 1) * TPW;
 
-    auto g16 = cg::tiled_partition<16>(cg::this_thread_block());
-
     if (!halfwarp_lane_id)
     {
         s_blksmem_tny_cnt_local[0] = 0;
@@ -953,7 +1026,6 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_halfwarp(const int *d_blkro
                                                  s_matched_posa_local, s_matched_posb_local,
                                                  SPECULATIVE_INTERSECTION, s_matchedcnt_local,
                                                  halfwarp_lane_id, HALFWARP_SIZE);
-                g16.sync();
                 matchedcnt = s_matchedcnt_local[0];
 
                 if (matchedcnt == 0)
@@ -1101,7 +1173,7 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_halfwarp(const int *d_blkro
             }
         }
 
-        int nnzcnt_sum = sum_16_shfl_cg(nnzcnt);
+        int nnzcnt_sum = sum_16_shfl(nnzcnt);
 
         int nnzcnt_scan = scan_32_shfl(nnzcnt, lane_id);
 
@@ -1274,8 +1346,6 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_warp(const int *d_blkrowptr
 
     int tile_end = tile_start + TILE_PER_WARP; //(global_warp_id + 1) * TPW;
 
-    auto g32 = cg::tiled_partition<32>(cg::this_thread_block());
-
     if (!warp_lane_id)
     {
         s_blksmem_tny_cnt_local[0] = 0;
@@ -1323,7 +1393,6 @@ __global__ void tile_spgemm_step3_cuda_kernel_2level_warp(const int *d_blkrowptr
                                                  s_matched_posa_local, s_matched_posb_local,
                                                  SPECULATIVE_INTERSECTION, s_matchedcnt_local,
                                                  warp_lane_id, WARP_SIZE);
-                g32.sync();
                 matchedcnt = s_matchedcnt_local[0];
 
                 if (matchedcnt == 0)
@@ -1799,7 +1868,7 @@ __global__ void tile_spgemm_step3_cuda_kernel_dns_halfwarp(const int *d_blkrowpt
         int nnzcnt_scan[25] = {};
 #pragma unroll
         for (int temp = 0; temp < (TILE_SIZE_M + HALFWARP_SIZE - 1) / HALFWARP_SIZE; temp++){
-            nnzcnt_sum_[temp] = sum_16_shfl_cg(nnzcnt[temp]);
+            nnzcnt_sum_[temp] = sum_16_shfl(nnzcnt[temp]);
             nnzcnt_scan[temp] = scan_32_shfl(nnzcnt[temp], lane_id);
             nnzcnt_scan[temp] -= nnzcnt[temp];
             nnzcnt_scan[temp] -= __shfl_sync(0xffffffff, nnzcnt_scan[temp], (lane_id >> 4) << 4);
@@ -1812,7 +1881,7 @@ __global__ void tile_spgemm_step3_cuda_kernel_dns_halfwarp(const int *d_blkrowpt
             nnzcnt_scan[temp] += nnzcnt_sum;
             nnzcnt_sum += nnzcnt_sum_[temp];
         }
-        // int nnzcnt_sum = sum_16_shfl_cg(nnzcnt);
+        // int nnzcnt_sum = sum_16_shfl(nnzcnt);
         
         // int nnzcnt_scan = scan_32_shfl(nnzcnt, lane_id);
         // nnzcnt_scan -= nnzcnt;
@@ -1981,8 +2050,6 @@ __global__ void tile_spgemm_step4_cuda_sparse_kernel_adaptive_warp(int *d_blkrow
     const int warp_lane_id = (WARP_SIZE - 1) & threadIdx.x;
     const int c_tile_lane_id = (THREADS_USED - 1) & threadIdx.x;
 
-    auto g = cg::tiled_partition<THREADS_USED>(cg::this_thread_block());
-
     // Initial the value of matrix C, not to change
     for (int i = c_tile_lane_id; i < blknnzctotal; i += THREADS_USED){
         d_blkcsr_Val_C[nnzcstart + i] = 0.0;
@@ -2047,8 +2114,7 @@ __global__ void tile_spgemm_step4_cuda_sparse_kernel_adaptive_warp(int *d_blkrow
                                                    s_matched_posa_local, s_matched_posb_local,
                                                    SPECULATIVE_INTERSECTION, s_matchedcnt_local,
                                                    c_tile_lane_id, THREADS_USED);
-
-        g.sync();
+                                                //    warp_lane_id, WARP_SIZE);
 
         // #if (THREADS_USED > 32)
         //     __syncthreads();
@@ -2355,8 +2421,6 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp(int *d_blkrowptr
         }
     }
 
-    auto g = cg::tiled_partition<THREADS_USED>(cg::this_thread_block());
-
     if (!c_tile_lane_id)
         s_matchedcnt_local[0] = 0;
 
@@ -2387,7 +2451,6 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp(int *d_blkrowptr
                                                    SPECULATIVE_INTERSECTION, s_matchedcnt_local,
                                                    c_tile_lane_id, THREADS_USED);
 
-        g.sync();
         matchedcnt = s_matchedcnt_local[0];
     }
 
@@ -2562,336 +2625,414 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp(int *d_blkrowptr
     }
 }
 
-template <int THREADS_USED = 32>
-__global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core(int *d_blkrowptrA,
-                                                                    const int *__restrict__ d_blkcolidxA,
-                                                                    int *d_nnzb_A,
-                                                                    MAT_VAL_TYPE *d_blkcsr_Val_A,
-                                                                    TILE_CSR_COL_TYPE_A *d_blkcsr_Col_A,
-                                                                    TILE_CSR_PTR_TYPE *d_blkcsr_Ptr_A,
-                                                                    // New Argument: Dense Data A
-                                                                    MAT_VAL_TYPE *d_dense_val_A,
-                                                                    int blkmA, int blknA, int numblkA, int nnzA,
-                                                                    const int *__restrict__ d_blkcolptrB,
-                                                                    const int *__restrict__ d_blkrowidxB,
-                                                                    const int *__restrict__ d_nnzb_B,
-                                                                    const MAT_VAL_TYPE *__restrict__ d_blkcsr_Val_B,
-                                                                    const TILE_CSR_COL_TYPE_B *__restrict__ d_blkcsr_Col_B,
-                                                                    const TILE_CSR_PTR_TYPE *__restrict__ d_blkcsr_Ptr_B,
-                                                                    // New Argument: Dense Data B
-                                                                    MAT_VAL_TYPE *d_dense_val_B,
-                                                                    int blkmB, int blknB, int numblkB, int nnzB,
-                                                                    int *d_blkrowidxC,
-                                                                    int *d_blkcolidxC,
-                                                                    TILE_CSR_PTR_TYPE *d_blkcsr_Ptr_C,
-                                                                    TILE_CSR_COL_TYPE_B *d_blkcsr_Col_C,
-                                                                    MAT_VAL_TYPE *d_blkcsr_Val_C,
-                                                                    int *d_nnzb_C,
-                                                                    TILE_MASK_TYPE_B *d_blkmaskC,
-                                                                    int numblkC,
-                                                                    int *d_blkid,
-                                                                    int *d_spec_intersection_cnt,
-                                                                    int *d_spec_intersection_posa,
-                                                                    int *d_spec_intersection_posb,
-                                                                    // New Argument: Flag for dense calculation
-                                                                    int *d_has_dense_calculated)
-{
-    const int global_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int global_warp_id = global_id / THREADS_USED;
+// template <int THREADS_USED = 32>
+// __global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core(int *d_blkrowptrA,
+//                                                                     const int *__restrict__ d_blkcolidxA,
+//                                                                     int *d_nnzb_A,
+//                                                                     MAT_VAL_TYPE *d_blkcsr_Val_A,
+//                                                                     TILE_CSR_COL_TYPE_A *d_blkcsr_Col_A,
+//                                                                     TILE_CSR_PTR_TYPE *d_blkcsr_Ptr_A,
+//                                                                     int blkmA, int blknA, int numblkA, int nnzA,
+//                                                                     const int *__restrict__ d_blkcolptrB,
+//                                                                     const int *__restrict__ d_blkrowidxB,
+//                                                                     const int *__restrict__ d_nnzb_B,
+//                                                                     const MAT_VAL_TYPE *__restrict__ d_blkcsr_Val_B,
+//                                                                     const TILE_CSR_COL_TYPE_B *__restrict__ d_blkcsr_Col_B,
+//                                                                     const TILE_CSR_PTR_TYPE *__restrict__ d_blkcsr_Ptr_B,
+//                                                                     int blkmB, int blknB, int numblkB, int nnzB,
+//                                                                     const MAT_VAL_TYPE *__restrict__ d_dense_A,  // 稠密矩阵A（行主序）
+//                                                                     const MAT_VAL_TYPE *__restrict__ d_dense_B,  // 稠密矩阵B（列主序）
+//                                                                     int dense_mA, int dense_nA,  // 矩阵A的维度
+//                                                                     int dense_mB, int dense_nB,  // 矩阵B的维度
+//                                                                     int *d_blkrowidxC,
+//                                                                     int *d_blkcolidxC,
+//                                                                     TILE_CSR_PTR_TYPE *d_blkcsr_Ptr_C,
+//                                                                     TILE_CSR_COL_TYPE_B *d_blkcsr_Col_C,
+//                                                                     MAT_VAL_TYPE *d_blkcsr_Val_C,
+//                                                                     int *d_nnzb_C,
+//                                                                     TILE_MASK_TYPE_B *d_blkmaskC,
+//                                                                     int numblkC,
+//                                                                     int *d_blkid,
+//                                                                     int *d_spec_intersection_cnt,
+//                                                                     int *d_spec_intersection_posa,
+//                                                                     int *d_spec_intersection_posb)
+// {
+//     const int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+//     int global_warp_id = global_id / THREADS_USED;
 
-    if (global_warp_id >= numblkC)
-        return;
-    int tilei = d_blkid[global_warp_id];
+//     if (global_warp_id >= numblkC)
+//         return;
+//     int tilei = d_blkid[global_warp_id];
 
-    const int nnzcstart = d_nnzb_C[tilei];
-    const int blknnzctotal = d_nnzb_C[tilei + 1] - nnzcstart;
-    if (!blknnzctotal)
-        return;
+//     const int nnzcstart = d_nnzb_C[tilei];
+//     const int blknnzctotal = d_nnzb_C[tilei + 1] - nnzcstart;
+//     if (!blknnzctotal)
+//         return;
 
-    const int total_threads = STEP4_THREADS;
-    const int local_warp_id = threadIdx.x / THREADS_USED; 
+//     const int total_threads = STEP4_THREADS;
+//     const int local_warp_id = threadIdx.x / THREADS_USED; //threadIdx.x / HALFWARP_SIZE;
     
-    // Ensure Shared Memory is aligned for double precision (8 bytes) or 128-bit vector loads if needed
-    // Standard __shared__ declarations are usually sufficiently aligned.
-    const int shared_val_c_size = total_threads / THREADS_USED * TILE_SIZE_M * TILE_SIZE_M * sizeof(MAT_VAL_TYPE);
+//     const int shared_val_c_size = total_threads / THREADS_USED * TILE_SIZE_M * TILE_SIZE_M * sizeof(MAT_VAL_TYPE);
 
-   
-    #if shared_val_c_size >= 32768
-        MAT_VAL_TYPE s_blkcsr_Val_C[total_threads / THREADS_USED * TILE_SIZE_M * TILE_SIZE_M] = {};
-    #else
-        __shared__ MAT_VAL_TYPE s_blkcsr_Val_C[total_threads / THREADS_USED * TILE_SIZE_M * TILE_SIZE_M];
-    #endif
+//     #if shared_val_c_size >= 32768
+//         MAT_VAL_TYPE s_blkcsr_Val_C[total_threads / THREADS_USED * TILE_SIZE_M * TILE_SIZE_M] = {};
+//     #else
+//         __shared__ MAT_VAL_TYPE s_blkcsr_Val_C[total_threads / THREADS_USED * TILE_SIZE_M * TILE_SIZE_M];
+//     #endif
 
-    MAT_VAL_TYPE *s_blkcsr_Val_C_local = &s_blkcsr_Val_C[local_warp_id * TILE_SIZE_M * TILE_SIZE_M];
+//     MAT_VAL_TYPE *s_blkcsr_Val_C_local = &s_blkcsr_Val_C[local_warp_id * TILE_SIZE_M * TILE_SIZE_M];
 
-    __shared__ int s_matched_posa[total_threads / THREADS_USED * SPECULATIVE_INTERSECTION];
-    __shared__ int s_matched_posb[total_threads / THREADS_USED * SPECULATIVE_INTERSECTION];
-    __shared__ int s_matchedcnt[total_threads / THREADS_USED];
+//     __shared__ int s_matched_posa[total_threads / THREADS_USED * SPECULATIVE_INTERSECTION];
+//     __shared__ int s_matched_posb[total_threads / THREADS_USED * SPECULATIVE_INTERSECTION];
+//     __shared__ int s_matchedcnt[total_threads / THREADS_USED];
 
-    // const int c_tile_lane_id = (TILE_SIZE_M - 1) & threadIdx.x;
-    const int c_tile_lane_id = (THREADS_USED - 1) & threadIdx.x;
-    
-    int *s_matched_posa_local = &s_matched_posa[local_warp_id * SPECULATIVE_INTERSECTION];
-    int *s_matched_posb_local = &s_matched_posb[local_warp_id * SPECULATIVE_INTERSECTION];
-    int *s_matchedcnt_local = &s_matchedcnt[local_warp_id];
+//     const int c_tile_lane_id = (TILE_SIZE_M - 1) & threadIdx.x;
+//     const int warp_lane_id = (WARP_SIZE - 1) & threadIdx.x;
 
-    // Initialize Accumulator C in Shared Memory to 0.0
-#pragma unroll
-    for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
-#pragma unroll
-        for (int i = 0; i < TILE_SIZE_M; i++){
-            s_blkcsr_Val_C_local[i * TILE_SIZE_M + c_adaptwarp_idx] = 0.0;
-        }
-    }
+//     int *s_matched_posa_local = &s_matched_posa[local_warp_id * SPECULATIVE_INTERSECTION];
+//     int *s_matched_posb_local = &s_matched_posb[local_warp_id * SPECULATIVE_INTERSECTION];
+//     int *s_matchedcnt_local = &s_matchedcnt[local_warp_id];
 
-    auto g = cg::tiled_partition<THREADS_USED>(cg::this_thread_block());
+// #pragma unroll
+//     for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
+// #pragma unroll
+//         for (int i = 0; i < TILE_SIZE_M; i++){
+//             s_blkcsr_Val_C_local[i * TILE_SIZE_M + c_adaptwarp_idx] = 0.0;
+//         }
+//     }
 
-    if (!c_tile_lane_id)
-        s_matchedcnt_local[0] = 0;
+//     if (!c_tile_lane_id)
+//         s_matchedcnt_local[0] = 0;
 
-    const int blki = d_blkrowidxC[tilei];
-    const int blkj = d_blkcolidxC[tilei];
+//     const int blki = d_blkrowidxC[tilei];
+//     const int blkj = d_blkcolidxC[tilei];
 
-    const int abase = d_blkrowptrA[blki];
-    const int astop = d_blkrowptrA[blki + 1];
-    int lena = astop - abase;
+//     const int abase = d_blkrowptrA[blki];
+//     const int astop = d_blkrowptrA[blki + 1];
+//     int lena = astop - abase;
 
-    const int bbase = ld_gbl_auto(d_blkcolptrB + blkj);
-    const int bstop = ld_gbl_auto(d_blkcolptrB + blkj + 1);
-    int lenb = bstop - bbase;
+//     const int bbase = ld_gbl_auto(d_blkcolptrB + blkj);
+//     const int bstop = ld_gbl_auto(d_blkcolptrB + blkj + 1);
+//     int lenb = bstop - bbase;
 
-    int matchedcnt = 0;
-    int specres = 0;
+//     int matchedcnt = 0;
+//     int specres = 0;
 
-    if (USE_GMEM_SPECULATIVE_INTERSECTION)
-        matchedcnt = d_spec_intersection_cnt[tilei];
+//     if (USE_GMEM_SPECULATIVE_INTERSECTION)
+//         matchedcnt = d_spec_intersection_cnt[tilei];
 
-    if (USE_GMEM_SPECULATIVE_INTERSECTION && matchedcnt > 0)
-    {}
-    else
-    {
-        specres = intersection_binarysearch_kernel(d_blkcolidxA, abase, astop, lena,
-                                                   d_blkrowidxB, bbase, bstop, lenb,
-                                                   s_matched_posa_local, s_matched_posb_local,
-                                                   SPECULATIVE_INTERSECTION, s_matchedcnt_local,
-                                                   c_tile_lane_id, THREADS_USED);
+//     if (USE_GMEM_SPECULATIVE_INTERSECTION && matchedcnt > 0)
+//     {}
+//     else
+//     {
+//         specres = intersection_binarysearch_kernel(d_blkcolidxA, abase, astop, lena,
+//                                                    d_blkrowidxB, bbase, bstop, lenb,
+//                                                    s_matched_posa_local, s_matched_posb_local,
+//                                                    SPECULATIVE_INTERSECTION, s_matchedcnt_local,
+//                                                    c_tile_lane_id, THREADS_USED);
+
+//         matchedcnt = s_matchedcnt_local[0];
+//     }
+
+//     if (matchedcnt <= SPECULATIVE_INTERSECTION && specres == 0)
+//     {      
+//         // Tensor Core fragment大小配置
+//         constexpr int FRAG_M = 8;
+//         constexpr int FRAG_N = 8;
+//         constexpr int FRAG_K = 4;
         
-        g.sync();
-        matchedcnt = s_matchedcnt_local[0];
-    }
+//         // 计算需要多少个fragment来覆盖整个tile
+//         constexpr int FRAG_M_COUNT = (TILE_SIZE_M + FRAG_M - 1) / FRAG_M;
+//         constexpr int FRAG_N_COUNT = (TILE_SIZE_M + FRAG_N - 1) / FRAG_N;
+//         constexpr int FRAG_K_COUNT = (TILE_SIZE_N + FRAG_K - 1) / FRAG_K;
 
-    g.sync(); 
+//         // 对于每个匹配的tile对，使用Tensor Core计算
+//         for (int i = 0; i < matchedcnt; i++)
+//         {
+//             int posa = s_matched_posa_local[i];
+//             int posb = s_matched_posb_local[i];
+            
+//             // 获取tile在原始矩阵中的位置
+//             int tile_row_a = blki * TILE_SIZE_M;
+//             int tile_col_a = d_blkcolidxA[abase + posa] * TILE_SIZE_N;
+//             int tile_row_b = d_blkrowidxB[bbase + posb] * TILE_SIZE_N;
+//             int tile_col_b = blkj * TILE_SIZE_M;
+            
+//             // 声明fragment（根据编译时tile大小选择）
+//             wmma::fragment<wmma::accumulator, FRAG_M, FRAG_N, FRAG_K, MAT_VAL_TYPE> acc_frag;
+//             wmma::fragment<wmma::matrix_a, FRAG_M, FRAG_N, FRAG_K, MAT_VAL_TYPE, wmma::row_major> a_frag;
+//             wmma::fragment<wmma::matrix_b, FRAG_M, FRAG_N, FRAG_K, MAT_VAL_TYPE, wmma::col_major> b_frag;
+            
+//             // 临时数组存储fragment结果
+//             MAT_VAL_TYPE temp_result[FRAG_M * FRAG_K];
 
-    if (matchedcnt <= SPECULATIVE_INTERSECTION && specres == 0)
-    {   
-        // Declare Accumulators for the WHOLE tile
-        const int NUM_SUBTILES = TILE_SIZE_M / 8;
-        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE, wmma::row_major> b_frag;
-        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE> c_frag[NUM_SUBTILES + 1][NUM_SUBTILES + 1];
-
-        // Clear Accumulators
-#pragma unroll
-        for(int i = 0; i < NUM_SUBTILES; i++)
-#pragma unroll
-            for(int j = 0; j < NUM_SUBTILES; j++){
-                wmma::fill_fragment(c_frag[i][j], 0.0);
-            }
-
-        // Accumulate over Global Intersections (The "Outer K")
-        for (int k = 0; k < matchedcnt; k++)
-        {
-            int posa = s_matched_posa_local[k];
-            int posb = s_matched_posb_local[k];
-
-            long long offset_A = (long long)(abase + posa) * TILE_SIZE_M * TILE_SIZE_N; 
-            long long offset_B = (long long)(bbase + posb) * TILE_SIZE_N * TILE_SIZE_M; 
-
-            MAT_VAL_TYPE *tile_A_ptr = d_dense_val_A + offset_A;
-            MAT_VAL_TYPE *tile_B_ptr = d_dense_val_B + offset_B;
-
-            // Helper function to handle the 8, 16, or 32 tiling
-#pragma unroll
-            for (int k_step = 0; k_step < TILE_SIZE_N; k_step += WMMA_K){
-#pragma unroll
-                for (int i = 0; i < NUM_SUBTILES; i++) {
-#pragma unroll
-                    for (int j = 0; j < NUM_SUBTILES; j++) {
+//         #pragma unroll
+//             // 循环计算所有fragment，覆盖整个TILE_SIZE_M x TILE_SIZE_M的结果tile
+//             for (int frag_m = 0; frag_m < FRAG_M_COUNT; frag_m++)
+//             {
+//         #pragma unroll
+//                 for (int frag_n = 0; frag_n < FRAG_N_COUNT; frag_n++)
+//                 {
+//                     // 初始化累加器
+//                     wmma::fill_fragment(acc_frag, (MAT_VAL_TYPE)0.0);
+                    
+//                     // K维度循环（矩阵乘法的内积维度）
+//                     for (int frag_k = 0; frag_k < FRAG_K_COUNT; frag_k++)
+//                     {
+//                         // 计算当前fragment在tile中的位置
+//                         int a_row_offset = frag_m * FRAG_M;
+//                         int a_col_offset = frag_k * FRAG_K;
+//                         int b_row_offset = frag_k * FRAG_K;
+//                         int b_col_offset = frag_n * FRAG_N;
                         
-                        // 1. Load A Sub-tile (8x4)
-                        // Pointer arithmetic: Base + (Row_Offset * Stride) + Col_Offset
-                        // Row_Offset = i * 8 (pixel rows)
-                        // Stride = TILE_SIZE
-                        // Col_Offset = k_step (current inner K position)
-                        const MAT_VAL_TYPE *ptr_a = tile_A_ptr + (i * WMMA_M * TILE_SIZE_M) + k_step;
+//                         // 计算在原始矩阵中的实际位置
+//                         int a_row = tile_row_a + a_row_offset;
+//                         int a_col = tile_col_a + a_col_offset;
+//                         int b_row = tile_row_b + b_row_offset;
+//                         int b_col = tile_col_b + b_col_offset;
                         
-                        // 2. Load B Sub-tile (4x8)
-                        // Row_Offset = k_step
-                        // Col_Offset = j * 8
-                        const MAT_VAL_TYPE *ptr_b = tile_B_ptr + (k_step * TILE_SIZE_M) + (j * WMMA_N);
+//                         // 边界检查：确保不越界
+//                         // 注意：即使tile小于fragment大小，load_matrix_sync也会安全处理
+//                         // 但我们需要确保不访问超出tile范围的数据
+//                         bool valid_a = (a_row_offset < TILE_SIZE_M) && (a_col_offset < TILE_SIZE_N);
+//                         bool valid_b = (b_row_offset < TILE_SIZE_N) && (b_col_offset < TILE_SIZE_M);
+                        
+//                         if (valid_a && valid_b)
+//                         {
+//                             // 加载A fragment（行主序：dense_A[i * n + j]）
+//                             const MAT_VAL_TYPE *a_ptr = d_dense_A + a_row * dense_nA + a_col;
+//                             wmma::load_matrix_sync(a_frag, a_ptr, dense_nA);
+                            
+//                             // 加载B fragment（列主序：dense_B[i + j * m]）
+//                             const MAT_VAL_TYPE *b_ptr = d_dense_B + b_row + b_col * dense_mB;
+//                             wmma::load_matrix_sync(b_frag, b_ptr, dense_mB);
+//                         }
+//                         else
+//                         {
+//                             // 如果超出边界，填充零
+//                             wmma::fill_fragment(a_frag, (MAT_VAL_TYPE)0.0);
+//                             wmma::fill_fragment(b_frag, (MAT_VAL_TYPE)0.0);
+//                         }
+                        
+//                         // 执行Tensor Core矩阵乘法并累加
+//                         wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+//                     }
+                    
+//                     // 将结果存储到临时数组
+//                     wmma::store_matrix_sync(temp_result, acc_frag, FRAG_N, wmma::mem_row_major);
+                    
+//                     // 将结果累加到共享内存
+//                     #pragma unroll
+//                     for (int local_row = 0; local_row < FRAG_M; local_row++)
+//                     {
+//                         #pragma unroll
+//                         for (int local_col = 0; local_col < FRAG_N; local_col++)
+//                         {
+//                             int global_row = frag_m * FRAG_M + local_row;
+//                             int global_col = frag_n * FRAG_N + local_col;
+                            
+//                             if (global_row < TILE_SIZE_M && global_col < TILE_SIZE_M)
+//                             {
+//                                 int frag_idx = local_row * FRAG_N + local_col;
+//                                 s_blkcsr_Val_C_local[global_row * TILE_SIZE_M + global_col] += temp_result[frag_idx];
+//                             }
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+//     }
+// else
+//     {
+//         const int astart = d_blkcolidxA[abase];
+//         const int aend = d_blkcolidxA[astop - 1];
+//         const int bstart = ld_gbl_auto(d_blkrowidxB + bbase);
+//         const int bend = ld_gbl_auto(d_blkrowidxB + bstop - 1);
 
-                        // Load Sync: Must be warp-uniform
-                        wmma::load_matrix_sync(a_frag, ptr_a, TILE_SIZE_N);
-                        wmma::load_matrix_sync(b_frag, ptr_b, TILE_SIZE_M);
+//         int posa_real = 0;
+//         int posb_real = 0;
+//         if (bstart > astart)
+//         {
+//             int posa_real_new = binary_search_right_boundary_kernel(d_blkcolidxA + abase, bstart, lena);
+//             posa_real = posa_real_new < 0 ? 0 : posa_real_new;
+//         }
+//         else if (bstart < astart)
+//         {
+//             int posb_real_new = binary_search_right_boundary_kernel(d_blkrowidxB + bbase, astart, lenb);
+//             posb_real = posb_real_new < 0 ? 0 : posb_real_new;
+//         }
 
+//         if (bstop < astop)
+//         {
+//             int lena_new = binary_search_right_boundary_kernel(d_blkcolidxA + abase, bend, lena) + 1;
+//             lena = lena_new > lena ? lena : lena_new;
+//         }
+//         else if (bstop > astop)
+//         {
+//             int lenb_new = binary_search_right_boundary_kernel(d_blkrowidxB + bbase, aend, lenb) + 1;
+//             lenb = lenb_new > lenb ? lenb : lenb_new;
+//         }
 
-                        // // 3. MMA: C = A * B + C
-                        wmma::mma_sync(c_frag[i][j], a_frag, b_frag, c_frag[i][j]);
-                    }
-                }
-            }
-        }
+//         int posa = posa_real;
+//         int posb = posb_real;
+//         int idxa = 0;
+//         int idxb = 0;
+//         int posa_updated = 1;
+//         int posb_updated = 1;
 
-#pragma unroll
-        for(int i=0; i<NUM_SUBTILES; i++) {
-#pragma unroll
-            for(int j=0; j<NUM_SUBTILES; j++) {
-                // Calculate pointer to the specific 8x8 patch in shared mem
-                MAT_VAL_TYPE *dst_ptr = s_blkcsr_Val_C_local + (i * 8 * TILE_SIZE_M) + (j * 8);
-                // IMPORTANT: Pass TILE_SIZE_M as stride, not 8!
-                wmma::store_matrix_sync(dst_ptr, c_frag[i][j], TILE_SIZE_M, wmma::mem_row_major);
-            }
-        }
-        
-    }
-    else
-    {
-        const int astart = d_blkcolidxA[abase];
-        const int aend = d_blkcolidxA[astop - 1];
-        const int bstart = ld_gbl_auto(d_blkrowidxB + bbase);
-        const int bend = ld_gbl_auto(d_blkrowidxB + bstop - 1);
+//         while (posa < lena && posb < lenb)
+//         {
+//             idxa = posa_updated ? ld_gbl_auto(d_blkcolidxA + abase + posa) : idxa; //a[posa] : idxa;
+//             idxb = posb_updated ? ld_gbl_auto(d_blkrowidxB + bbase + posb) : idxb; //b[posb] : idxb;
 
-        int posa_real = 0;
-        int posb_real = 0;
-        if (bstart > astart) {
-            int posa_real_new = binary_search_right_boundary_kernel(d_blkcolidxA + abase, bstart, lena);
-            posa_real = posa_real_new < 0 ? 0 : posa_real_new;
-        } else if (bstart < astart) {
-            int posb_real_new = binary_search_right_boundary_kernel(d_blkrowidxB + bbase, astart, lenb);
-            posb_real = posb_real_new < 0 ? 0 : posb_real_new;
-        }
+//             if (idxa == idxb)
+//             {  
+//                 // Tensor Core fragment大小配置（与上面保持一致）
+//                 constexpr int FRAG_M = 8;
+//                 constexpr int FRAG_N = 8;
+//                 constexpr int FRAG_K = 4;
+//                 constexpr int FRAG_M_COUNT = (TILE_SIZE_M + FRAG_M - 1) / FRAG_M;
+//                 constexpr int FRAG_N_COUNT = (TILE_SIZE_M + FRAG_N - 1) / FRAG_N;
+//                 constexpr int FRAG_K_COUNT = (TILE_SIZE_N + FRAG_K - 1) / FRAG_K;
+                
+//                 // 获取tile在原始矩阵中的位置
+//                 int tile_row_a = blki * TILE_SIZE_M;
+//                 int tile_col_a = idxa * TILE_SIZE_N;
+//                 int tile_row_b = idxb * TILE_SIZE_N;
+//                 int tile_col_b = blkj * TILE_SIZE_M;
+                
+//                 // 声明fragment
+//                 wmma::fragment<wmma::accumulator, FRAG_M, FRAG_N, FRAG_K, MAT_VAL_TYPE> acc_frag;
+//                 wmma::fragment<wmma::matrix_a, FRAG_M, FRAG_N, FRAG_K, MAT_VAL_TYPE, wmma::row_major> a_frag;
+//                 wmma::fragment<wmma::matrix_b, FRAG_M, FRAG_N, FRAG_K, MAT_VAL_TYPE, wmma::col_major> b_frag;
+//                 MAT_VAL_TYPE temp_result[FRAG_M * FRAG_N];
+                
+//                 // 循环计算所有fragment
+//                 for (int frag_m = 0; frag_m < FRAG_M_COUNT; frag_m++)
+//                 {
+//                     for (int frag_n = 0; frag_n < FRAG_N_COUNT; frag_n++)
+//                     {
+//                         wmma::fill_fragment(acc_frag, 0.0);
+                        
+//                         for (int frag_k = 0; frag_k < FRAG_K_COUNT; frag_k++)
+//                         {
+//                             int a_row_offset = frag_m * FRAG_M;
+//                             int a_col_offset = frag_k * FRAG_K;
+//                             int b_row_offset = frag_k * FRAG_K;
+//                             int b_col_offset = frag_n * FRAG_N;
+                            
+//                             int a_row = tile_row_a + a_row_offset;
+//                             int a_col = tile_col_a + a_col_offset;
+//                             int b_row = tile_row_b + b_row_offset;
+//                             int b_col = tile_col_b + b_col_offset;
+                            
+//                             // 边界检查
+//                             bool valid_a = (a_row_offset < TILE_SIZE_M) && (a_col_offset < TILE_SIZE_N);
+//                             bool valid_b = (b_row_offset < TILE_SIZE_N) && (b_col_offset < TILE_SIZE_M);
+                            
+//                             if (valid_a && valid_b)
+//                             {
+//                                 // 加载A fragment（行主序）
+//                                 const MAT_VAL_TYPE *a_ptr = d_dense_A + a_row * dense_nA + a_col;
+//                                 wmma::load_matrix_sync(a_frag, a_ptr, dense_nA);
+                                
+//                                 // 加载B fragment（列主序）
+//                                 const MAT_VAL_TYPE *b_ptr = d_dense_B + b_row + b_col * dense_mB;
+//                                 wmma::load_matrix_sync(b_frag, b_ptr, dense_mB);
+//                             }
+//                             else
+//                             {
+//                                 wmma::fill_fragment(a_frag, 0.0);
+//                                 wmma::fill_fragment(b_frag, 0.0);
+//                             }
+                            
+//                             // 执行Tensor Core矩阵乘法并累加
+//                             wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+//                         }
+                        
+//                         // 存储结果
+//                         wmma::store_matrix_sync(temp_result, acc_frag, FRAG_N, wmma::mem_row_major);
+                        
+//                         // 累加到共享内存
+//                         #pragma unroll
+//                         for (int local_row = 0; local_row < FRAG_M; local_row++)
+//                         {
+//                             #pragma unroll
+//                             for (int local_col = 0; local_col < FRAG_N; local_col++)
+//                             {
+//                                 int global_row = frag_m * FRAG_M + local_row;
+//                                 int global_col = frag_n * FRAG_N + local_col;
+                                
+//                                 if (global_row < TILE_SIZE_M && global_col < TILE_SIZE_M)
+//                                 {
+//                                     int frag_idx = local_row * FRAG_N + local_col;
+//                                     s_blkcsr_Val_C_local[global_row * TILE_SIZE_M + global_col] += temp_result[frag_idx];
+//                                 }
+//                             }
+//                         }
+//                     }
+//                 }
+//                 posa++;
+//                 posa_updated = 1;
+//                 posb++;
+//                 posb_updated = 1;
+//             }
+//             else
+//             {
+//                 // the smaller index goes forward
+//                 posa_updated = idxa < idxb ? 1 : 0;
+//                 posa += posa_updated;
+//                 posb_updated = idxa > idxb ? 1 : 0;
+//                 posb += posb_updated;
+//             }
+//         }
+//     }
 
-        if (bstop < astop) {
-            int lena_new = binary_search_right_boundary_kernel(d_blkcolidxA + abase, bend, lena) + 1;
-            lena = lena_new > lena ? lena : lena_new;
-        } else if (bstop > astop) {
-            int lenb_new = binary_search_right_boundary_kernel(d_blkrowidxB + bbase, aend, lenb) + 1;
-            lenb = lenb_new > lenb ? lenb : lenb_new;
-        }
+//     // Check
+//     if (blknnzctotal == TILE_SIZE_M * TILE_SIZE_M){
+// #pragma unroll
+//         for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
+// #pragma unroll
+//             for (int i = 0; i < TILE_SIZE_M; i++)
+//             {
+//                 int offset_local = i * TILE_SIZE_M + c_adaptwarp_idx;
+//                 d_blkcsr_Col_C[nnzcstart + offset_local] = c_adaptwarp_idx;
+//                 d_blkcsr_Val_C[nnzcstart + offset_local] = s_blkcsr_Val_C_local[offset_local];
+//             }
+//         }
+//     }
+//     else{
+//         const int ADAPTWARP_PER_TILE = (TILE_SIZE_M + THREADS_USED - 1) / THREADS_USED;
+//         TILE_MASK_TYPE_B maskc[MaskNumC] = {};
+//         TILE_CSR_PTR_TYPE blknnzcstart;
 
-        int posa = posa_real;
-        int posb = posb_real;
-        int idxa = 0;
-        int idxb = 0;
-        int posa_updated = 1;
-        int posb_updated = 1;
-        bool has_calc = false; // Track local calculation
+// #pragma unroll
+//         for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
+//             long long int pos_c = (long long int)(tilei) * TILE_SIZE_M + c_adaptwarp_idx;
+//             blknnzcstart = d_blkcsr_Ptr_C[pos_c];
+// #pragma unroll
+//             for (int maskid = 0; maskid < MaskNumC; maskid++){
+//                 maskc[maskid] = d_blkmaskC[pos_c * MaskNumC + maskid];
+//             }
 
-        while (posa < lena && posb < lenb)
-        {
-            idxa = posa_updated ? ld_gbl_auto(d_blkcolidxA + abase + posa) : idxa; 
-            idxb = posb_updated ? ld_gbl_auto(d_blkrowidxB + bbase + posb) : idxb; 
-
-            if (idxa == idxb)
-            {
-                const int nnzastart = d_nnzb_A[(abase + posa)];
-                int nnztotala = d_nnzb_A[(abase + posa) + 1] - nnzastart;
-                const TILE_CSR_PTR_TYPE *__restrict__ d_csrRowPtrB = &d_blkcsr_Ptr_B[(bbase + posb) * TILE_SIZE_N];
-                const int nnzbstart = ld_gbl_auto(d_nnzb_B + bbase + posb);
-                int nnztotalb = ld_gbl_auto(d_nnzb_B + bbase + posb + 1) - nnzbstart;
-#pragma unroll
-                for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){   
-                    TILE_CSR_PTR_TYPE offseta_start = d_blkcsr_Ptr_A[(abase + posa) * TILE_SIZE_M + c_adaptwarp_idx];
-                    TILE_CSR_PTR_TYPE offseta_end = c_adaptwarp_idx == TILE_SIZE_M - 1 ? nnztotala : d_blkcsr_Ptr_A[(abase + posa) * TILE_SIZE_M + c_adaptwarp_idx + 1];
-
-                    for (int i = offseta_start; i < offseta_end; i++)
-                    {
-                        TILE_CSR_COL_TYPE_A rowcolidx = d_blkcsr_Col_A[nnzastart + i];
-                        int rowidxa = rowcolidx / TILE_SIZE_N;
-                        int rowidxb = rowcolidx % TILE_SIZE_N;
-                        MAT_VAL_TYPE val = d_blkcsr_Val_A[nnzastart + i];
-
-                        const int startb = ld_gbl_auto(d_csrRowPtrB + rowidxb);
-                        const int stopb = rowidxb == TILE_SIZE_N - 1 ? nnztotalb : ld_gbl_auto(d_csrRowPtrB + rowidxb + 1);
-                        for (int k = startb; k < stopb; k++)
-                        {
-                            TILE_CSR_COL_TYPE_B colidx = ld_gbl_auto(d_blkcsr_Col_B + nnzbstart + k);
-                            MAT_VAL_TYPE valb = ld_gbl_auto(d_blkcsr_Val_B + nnzbstart + k);
-                            s_blkcsr_Val_C_local[rowidxa * TILE_SIZE_M + colidx] += val * valb;
-                        }
-                    }
-                }
-
-                posa++;
-                posa_updated = 1;
-                posb++;
-                posb_updated = 1;
-            }
-            else
-            {
-                posa_updated = idxa < idxb ? 1 : 0;
-                posa += posa_updated;
-                posb_updated = idxa > idxb ? 1 : 0;
-                posb += posb_updated;
-            }
-        }
-        
-        // Need to ensure all threads agree on updating the global flag
-        // However, 'has_calc' might be divergent here depending on loop path.
-        // It's safer to not update the flag in the fallback path or use ballot logic.
-        // For now, only the main dense path updates the flag.
-    }
-
-    // ... (Remainder of the function: Sparse write-back to Global Memory) ...
-    // Note: Ensure you have g.sync() before reading s_blkcsr_Val_C_local for the write-back phase
-    g.sync();
-
-    // Check
-    if (blknnzctotal == TILE_SIZE_M * TILE_SIZE_M){
-#pragma unroll
-        for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
-#pragma unroll
-            for (int i = 0; i < TILE_SIZE_M; i++)
-            {
-                int offset_local = i * TILE_SIZE_M + c_adaptwarp_idx;
-                d_blkcsr_Col_C[nnzcstart + offset_local] = c_adaptwarp_idx;
-                d_blkcsr_Val_C[nnzcstart + offset_local] = s_blkcsr_Val_C_local[offset_local];
-            }
-        }
-    }
-    else{
-        // Sparse write-back
-        const int ADAPTWARP_PER_TILE = (TILE_SIZE_M + THREADS_USED - 1) / THREADS_USED;
-        TILE_MASK_TYPE_B maskc[MaskNumC] = {};
-        TILE_CSR_PTR_TYPE blknnzcstart;
-
-#pragma unroll
-        for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
-            long long int pos_c = (long long int)(tilei) * TILE_SIZE_M + c_adaptwarp_idx;
-            blknnzcstart = d_blkcsr_Ptr_C[pos_c];
-#pragma unroll
-            for (int maskid = 0; maskid < MaskNumC; maskid++){
-                maskc[maskid] = d_blkmaskC[pos_c * MaskNumC + maskid];
-            }
-
-            int cnt = 0;
-#pragma unroll
-            for (int maskid = 0; maskid < MaskNumC; maskid++){
-#pragma unroll
-                for (int i = 0; i < MaskBitsC; i++)
-                {
-                    int idx = ((maskc[maskid] >> MaskBitsC - i - 1) & 0x1) == 1 ? (maskid * MaskBitsC) + i : -1;
-                    if (idx != -1)
-                    {
-                        d_blkcsr_Col_C[nnzcstart + blknnzcstart + cnt] = idx;
-                        d_blkcsr_Val_C[nnzcstart + blknnzcstart + cnt] = s_blkcsr_Val_C_local[c_adaptwarp_idx * TILE_SIZE_M + idx];
-                        cnt++;
-                    }
-                }
-            }
-        }
-    }
-}
+//             int cnt = 0;
+// #pragma unroll
+//             for (int maskid = 0; maskid < MaskNumC; maskid++){
+// #pragma unroll
+//                 for (int i = 0; i < MaskBitsC; i++)
+//                 {
+//                     int idx = ((maskc[maskid] >> MaskBitsC - i - 1) & 0x1) == 1 ? (maskid * MaskBitsC) + i : -1;
+//                     if (idx != -1)
+//                     {
+//                         d_blkcsr_Col_C[nnzcstart + blknnzcstart + cnt] = idx;
+//                         d_blkcsr_Val_C[nnzcstart + blknnzcstart + cnt] = s_blkcsr_Val_C_local[c_adaptwarp_idx * TILE_SIZE_M + idx];
+//                         cnt++;
+//                     }
+//                 }
+//             }
+//         }
+//     }
+// }
 
 void tilespgemm(SMatrixA *matrixA,
                 SMatrixB *matrixB,
@@ -2998,13 +3139,25 @@ void tilespgemm(SMatrixA *matrixA,
     cudaMalloc((void **)&d_blkmaskA, numblkA * TILE_SIZE_M * MaskNumA * sizeof(TILE_MASK_TYPE_A));
     cudaMemcpy(d_blkmaskA, blkmaskA, numblkA * TILE_SIZE_M * MaskNumA * sizeof(TILE_MASK_TYPE_A), cudaMemcpyHostToDevice);
 
-    MAT_VAL_TYPE *d_dense_val_A;
-    MAT_VAL_TYPE *d_dense_val_B;
-    int *d_has_dense_calculated;
-    cudaMalloc((void**)&d_dense_val_A, numblkA * TILE_SIZE_M * TILE_SIZE_N * sizeof(MAT_VAL_TYPE));
-    cudaMalloc((void**)&d_dense_val_B, numblkB * TILE_SIZE_N * TILE_SIZE_M * sizeof(MAT_VAL_TYPE));
-    cudaMemcpy(d_dense_val_A, matrixA->dense_data, numblkA * TILE_SIZE_M * TILE_SIZE_N * sizeof(MAT_VAL_TYPE), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dense_val_B, matrixB->dense_data, numblkB * TILE_SIZE_N * TILE_SIZE_M * sizeof(MAT_VAL_TYPE), cudaMemcpyHostToDevice);
+    // 分配和拷贝稠密矩阵（用于Tensor Core DMMA）
+    MAT_VAL_TYPE *d_dense_A = NULL;
+    MAT_VAL_TYPE *d_dense_B = NULL;
+    int dense_mA = matrixA->m;
+    int dense_nA = matrixA->n;
+    int dense_mB = matrixB->m;
+    int dense_nB = matrixB->n;
+    
+    if (USE_TENSORCORE && matrixA->has_dense_format && matrixA->dense_data != NULL)
+    {
+        cudaMalloc((void **)&d_dense_A, dense_mA * dense_nA * sizeof(MAT_VAL_TYPE));
+        cudaMemcpy(d_dense_A, matrixA->dense_data, dense_mA * dense_nA * sizeof(MAT_VAL_TYPE), cudaMemcpyHostToDevice);
+    }
+    
+    if (USE_TENSORCORE && matrixB->has_dense_format && matrixB->dense_data != NULL)
+    {
+        cudaMalloc((void **)&d_dense_B, dense_mB * dense_nB * sizeof(MAT_VAL_TYPE));
+        cudaMemcpy(d_dense_B, matrixB->dense_data, dense_mB * dense_nB * sizeof(MAT_VAL_TYPE), cudaMemcpyHostToDevice);
+    }
 
     int numblkC = 0;
     int nnzC = 0;
@@ -3061,20 +3214,27 @@ void tilespgemm(SMatrixA *matrixA,
 #endif
         if (blknB > NUMCOLC_SPA_OR_HASH_TH)
         {
-            /* Initialize bin */
-            init_bin(&bin, blkmA);
+            int num_threads = WARP_SIZE * WARP_PER_BLOCK;
+            int num_blocks = ceil((double)blkmA / (double)(WARP_PER_BLOCK));
+            tile_spgemm_step1_cuda_spa_kernel<<<num_blocks, num_threads>>>(d_blkrowptrA, d_blkcolidxA, blkmA,
+                                                                           d_blkrowptrB, d_blkcolidxB, blknB,
+                                                                           d_blkrowptrC);
+            exclusive_scan_device_cuda_thrust<int>(d_blkrowptrC, blkmA + 1);
+            cudaMemcpy(&numblkC, &d_blkrowptrC[blkmA], sizeof(int), cudaMemcpyDeviceToHost);
+            // /* Initialize bin */
+            // init_bin(&bin, blkmA);
 
-            /* Set max bin */
-            set_max_bin(d_blkrowptrA, d_blkcolidxA, d_blkrowptrB, &bin, blkmA);
-            /* Count nz of C */
-            set_row_nnz(d_blkrowptrA, d_blkcolidxA,
-                        d_blkrowptrB, d_blkcolidxB,
-                        d_blkrowptrC,
-                        &bin,
-                        blkmA,
-                        &numblkC);
-            /* Set bin */
-            set_min_bin(&bin, blkmA);
+            // /* Set max bin */
+            // set_max_bin(d_blkrowptrA, d_blkcolidxA, d_blkrowptrB, &bin, blkmA);
+            // /* Count nz of C */
+            // set_row_nnz(d_blkrowptrA, d_blkcolidxA,
+            //             d_blkrowptrB, d_blkcolidxB,
+            //             d_blkrowptrC,
+            //             &bin,
+            //             blkmA,
+            //             &numblkC);
+            // /* Set bin */
+            // set_min_bin(&bin, blkmA);
         }
         else
         {
@@ -3101,9 +3261,6 @@ void tilespgemm(SMatrixA *matrixA,
         cudaMalloc((void **)&d_blkrowidxC, numblkC * sizeof(int));
         int *d_blkcolidxC;
         cudaMalloc((void **)&d_blkcolidxC, numblkC * sizeof(int));
-        int *d_has_dense_calculated;
-        cudaMalloc((void**)&d_has_dense_calculated, numblkC * sizeof(bool));
-        cudaMemset(d_has_dense_calculated, 0, numblkC * sizeof(bool));
 
 #if TIMING
 
@@ -3129,11 +3286,20 @@ void tilespgemm(SMatrixA *matrixA,
 
         if (blknB > NUMCOLC_SPA_OR_HASH_TH)
         {
-            calculate_value_col_bin(d_blkrowptrA, d_blkcolidxA, NULL,
-                                    d_blkrowptrB, d_blkcolidxB, NULL,
-                                    d_blkrowptrC, d_blkrowidxC, d_blkcolidxC, NULL,
-                                    &bin, blkmA, blkmB);        
-            release_bin(bin);
+            int num_threads = WARP_SIZE * WARP_PER_BLOCK;
+            int num_blocks = ceil((double)blkmA / (double)(WARP_PER_BLOCK));
+            const int nmasks = ceil((float)blknB / 32.0f);
+            size_t shared_mem_size = WARP_SIZE * nmasks * sizeof(unsigned int);
+            tile_spgemm_step1_numeric_cuda_spa_kernel_withbin<<<num_blocks, num_threads, shared_mem_size>>>(d_blkrowptrA, d_blkcolidxA, blkmA,
+                                                                                   d_blkrowptrB, d_blkcolidxB, blknB,
+                                                                                   d_blkrowptrC, d_blkrowidxC, d_blkcolidxC,
+                                                                                   d_spec_intersection_cnt, d_spec_intersection_posa, d_spec_intersection_posb);
+            // /* Calculating value of C */
+            // calculate_value_col_bin(d_blkrowptrA, d_blkcolidxA, NULL,
+            //                         d_blkrowptrB, d_blkcolidxB, NULL,
+            //                         d_blkrowptrC, d_blkrowidxC, d_blkcolidxC, NULL,
+            //                         &bin, blkmA, blkmB);
+            // release_bin(bin);
         }
         else
         {
@@ -3162,9 +3328,6 @@ void tilespgemm(SMatrixA *matrixA,
 #endif
 
         long long int lengthC =  (long long int)numblkC * TILE_SIZE_M;
-
-        // printf("numblkC=%d\n", numblkC);
-        // printf("lengthC=%lld\n", lengthC);
 
         TILE_CSR_PTR_TYPE *d_blkcsr_Ptr_C;
         cudaMalloc((void **)&d_blkcsr_Ptr_C, lengthC * sizeof(TILE_CSR_PTR_TYPE));
@@ -3376,22 +3539,19 @@ void tilespgemm(SMatrixA *matrixA,
     // dns : 129 - dns
     if (blksmem_dns_cnt)
     {
-        #if USE_TENSORCORE
+#if USE_TENSORCORE
         num_threads = STEP4_THREADS;
         num_blocks = ceil((double)blksmem_dns_cnt / (double)(num_threads / THREADS_USED_DNS));
-        tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[3]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A,  d_blkcsr_Col_A, d_blkcsr_Ptr_A,
-                                                                                                                    d_dense_val_A, // [NEW] Pointer to dense Matrix A on device
-                                                                                                                    blkmA, blknA, numblkA, nnzA,
-                                                                                                                    d_blkcolptrB, d_blkrowidxB, d_nnzb_B, d_blkcsr_Val_B, d_blkcsr_Col_B, d_blkcsr_Ptr_B,
-                                                                                                                    d_dense_val_B, // [NEW] Pointer to dense Matrix B on device
-                                                                                                                    blkmB, blknB, numblkB, nnzB,
-                                                                                                                    d_blkrowidxC, d_blkcolidxC, d_blkcsr_Ptr_C,
-                                                                                                                    d_blkcsr_Col_C, d_blkcsr_Val_C,
-                                                                                                                    d_nnzb_C, d_blkmaskC, blksmem_dns_cnt, d_blkid_smem_dns,
-                                                                                                                    d_spec_intersection_cnt, d_spec_intersection_posa, d_spec_intersection_posb,
-                                                                                                                    d_has_dense_calculated // [NEW] Pointer to flag array on device
-        );
-        #else
+        tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[3]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A, d_blkcsr_Col_A, d_blkcsr_Ptr_A,
+                                                                                                        blkmA, blknA, numblkA, nnzA,
+                                                                                                        d_blkcolptrB, d_blkrowidxB, d_nnzb_B, d_blkcsr_Val_B, d_blkcsr_Col_B, d_blkcsr_Ptr_B,
+                                                                                                        blkmB, blknB, numblkB, nnzB,
+                                                                                                        d_dense_A, d_dense_B, dense_mA, dense_nA, dense_mB, dense_nB,
+                                                                                                        d_blkrowidxC, d_blkcolidxC, d_blkcsr_Ptr_C,
+                                                                                                        d_blkcsr_Col_C, d_blkcsr_Val_C,
+                                                                                                        d_nnzb_C, d_blkmaskC, blksmem_dns_cnt, d_blkid_smem_dns,
+                                                                                                        d_spec_intersection_cnt, d_spec_intersection_posa, d_spec_intersection_posb);
+#else
         num_threads = STEP4_THREADS;
         num_blocks = ceil((double)blksmem_dns_cnt / (double)(num_threads / THREADS_USED_DNS));
         tile_spgemm_step4_cuda_dns_kernel_adaptive_warp<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[3]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A, d_blkcsr_Col_A, d_blkcsr_Ptr_A,
@@ -3402,28 +3562,25 @@ void tilespgemm(SMatrixA *matrixA,
                                                                                                         d_blkcsr_Col_C, d_blkcsr_Val_C,
                                                                                                         d_nnzb_C, d_blkmaskC, blksmem_dns_cnt, d_blkid_smem_dns,
                                                                                                         d_spec_intersection_cnt, d_spec_intersection_posa, d_spec_intersection_posb);
-        #endif
+#endif
     }
 
     // ful : 256
     if (blksmem_ful_cnt)
     {
-        #if USE_TENSORCORE
+#if USE_TENSORCORE
         num_threads = STEP4_THREADS;
         num_blocks = ceil((double)blksmem_ful_cnt / (double)(num_threads / THREADS_USED_DNS));
-        tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[4]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A,  d_blkcsr_Col_A, d_blkcsr_Ptr_A,
-                                                                                                                    d_dense_val_A, // [NEW] Pointer to dense Matrix A on device
-                                                                                                                    blkmA, blknA, numblkA, nnzA,
-                                                                                                                    d_blkcolptrB, d_blkrowidxB, d_nnzb_B, d_blkcsr_Val_B, d_blkcsr_Col_B, d_blkcsr_Ptr_B,
-                                                                                                                    d_dense_val_B, // [NEW] Pointer to dense Matrix B on device
-                                                                                                                    blkmB, blknB, numblkB, nnzB,
-                                                                                                                    d_blkrowidxC, d_blkcolidxC, d_blkcsr_Ptr_C,
-                                                                                                                    d_blkcsr_Col_C, d_blkcsr_Val_C,
-                                                                                                                    d_nnzb_C, d_blkmaskC, blksmem_ful_cnt, d_blkid_smem_ful,
-                                                                                                                    d_spec_intersection_cnt, d_spec_intersection_posa, d_spec_intersection_posb,
-                                                                                                                    d_has_dense_calculated // [NEW] Pointer to flag array on device
-        );
-        #else
+        tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[4]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A, d_blkcsr_Col_A, d_blkcsr_Ptr_A,
+                                                                                                        blkmA, blknA, numblkA, nnzA,
+                                                                                                        d_blkcolptrB, d_blkrowidxB, d_nnzb_B, d_blkcsr_Val_B, d_blkcsr_Col_B, d_blkcsr_Ptr_B,
+                                                                                                        blkmB, blknB, numblkB, nnzB,
+                                                                                                        d_dense_A, d_dense_B, dense_mA, dense_nA, dense_mB, dense_nB,
+                                                                                                        d_blkrowidxC, d_blkcolidxC, d_blkcsr_Ptr_C,
+                                                                                                        d_blkcsr_Col_C, d_blkcsr_Val_C,
+                                                                                                        d_nnzb_C, d_blkmaskC, blksmem_ful_cnt, d_blkid_smem_ful,
+                                                                                                        d_spec_intersection_cnt, d_spec_intersection_posa, d_spec_intersection_posb);
+#else
         num_threads = STEP4_THREADS;
         num_blocks = ceil((double)blksmem_ful_cnt / (double)(num_threads / THREADS_USED_DNS));
         tile_spgemm_step4_cuda_dns_kernel_adaptive_warp<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[4]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A, d_blkcsr_Col_A, d_blkcsr_Ptr_A,
@@ -3434,7 +3591,7 @@ void tilespgemm(SMatrixA *matrixA,
                                                                                                         d_blkcsr_Col_C, d_blkcsr_Val_C,
                                                                                                         d_nnzb_C, d_blkmaskC, blksmem_ful_cnt, d_blkid_smem_ful,
                                                                                                         d_spec_intersection_cnt, d_spec_intersection_posa, d_spec_intersection_posb);
-        #endif
+#endif
     }
 
 #if TIMING
@@ -3545,6 +3702,12 @@ void tilespgemm(SMatrixA *matrixA,
     cudaFree(d_blkmaskA);
     cudaFree(d_blk_intersec_bitmask_A);
     cudaFree(d_blk_intersec_bitmask_B);
+    
+    // 释放稠密矩阵内存
+    if (d_dense_A != NULL)
+        cudaFree(d_dense_A);
+    if (d_dense_B != NULL)
+        cudaFree(d_dense_B);
 
     for (int i = 0; i < nstreams; i++)
     {
