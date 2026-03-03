@@ -1,0 +1,12 @@
+src/test
+.vscode
+.cursor
+data/*.csv
+src/benchmark_results
+bin*
+profile
+*log*
+*.out
+*.csv
+*.py
+*.ncu-rep
