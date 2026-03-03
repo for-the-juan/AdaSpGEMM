@@ -2562,34 +2562,56 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp(int *d_blkrowptr
     }
 }
 
-// TODO: change to bitmask
-template <int THREADS_USED, typename RowPtrT, typename ColIdxT, typename ValueT>
-__device__ __forceinline__ void csr_tile_to_dense(const RowPtrT  *__restrict__ csrRowPtr,
-                                                const ColIdxT  *__restrict__ csrColIdx,
-                                                const ValueT   *__restrict__ csrVal,
-                                                int rows, int cols, int nnz,
-                                                ValueT         *__restrict__ dense,
-                                                int leading_dim)
+template <typename MaskType, typename RowPtrT, typename ValueT>
+__device__ __forceinline__ void bitmask_tile_to_dense(
+    const RowPtrT  *__restrict__ rowPtr,
+    const MaskType *__restrict__ bitmasks,
+    const ValueT   *__restrict__ values,
+    const int rows,
+    const int cols,
+    ValueT         *__restrict__ dense)
 {
-    const int lane = threadIdx.x & (THREADS_USED - 1);
-    const unsigned mask =
-        THREADS_USED == warpSize ? 0xFFFFFFFFu : ((1u << THREADS_USED) - 1u);
+    static_assert(sizeof(MaskType) <= 4, "MaskType must be 8, 16, or 32 bits");
+    
+    constexpr int BITS_PER_MASK = sizeof(MaskType) * 8;
+    constexpr int ROWS_PER_STEP = 32 / BITS_PER_MASK;
 
-    for (int idx = lane; idx < rows * cols; idx += THREADS_USED) {
+    const int lane_id_ = threadIdx.x & (WARP_SIZE - 1);
+    const int leading_dim = cols;
+    const int local_row = lane_id_ / BITS_PER_MASK;
+    const int bit_idx   = lane_id_ % BITS_PER_MASK;
+
+
+#pragma unroll
+    for (int idx = lane_id_; idx < rows * cols; idx += WARP_SIZE) {
         dense[idx] = ValueT(0);
     }
-    __syncwarp(mask);
+    __syncwarp();
 
-    for (int r = lane; r < rows; r += THREADS_USED) {
-        const int start = csrRowPtr[r];
-        const int stop  = (r == rows - 1) ? nnz : csrRowPtr[r + 1];
-        ValueT *rowDense = dense + r * leading_dim;
-        for (int k = start; k < stop; ++k) {
-            const int c = static_cast<int>(csrColIdx[k]);
-            rowDense[c] = csrVal[k];
+#pragma unroll
+    for (int r = 0; r < rows; r += ROWS_PER_STEP) {
+        
+        int target_row = r + local_row;
+
+        if (target_row < rows && bit_idx < cols) {
+            
+            ValueT out_val = ValueT(0);
+            MaskType mask = bitmasks[target_row];
+            
+            MaskType current_bit = static_cast<MaskType>(1) << bit_idx;
+            
+            if (mask & current_bit) {
+                MaskType lower_mask = current_bit - 1;
+                int local_offset = __popc(static_cast<unsigned int>(mask & lower_mask));
+                int val_offset   = static_cast<int>(rowPtr[target_row]);
+                
+                out_val = values[val_offset + local_offset];
+            }
+
+            dense[target_row * leading_dim + bit_idx] = out_val;
         }
     }
-    __syncwarp(mask);
+    __syncwarp();
 }
 
 // Slot lock states
@@ -2620,37 +2642,10 @@ __device__ __forceinline__ void release_shared_slot(int *slot_locks, int slot_id
     }
 }
 
-// Try to find a slot that already contains the required tile (for caching)
-// Returns slot index if found, -1 otherwise
-__device__ __forceinline__ int find_cached_tile_slot(
-    int *slot_tile_ids, 
-    int num_slots, 
-    int required_tile_id,
-    int *slot_locks) {
-    
-    #if ENABLE_SLOT_TILE_CACHE
-    for (int i = 0; i < num_slots; i++) {
-        // Check if this slot has the tile we need (without acquiring lock first)
-        if (slot_tile_ids[i] == required_tile_id) {
-            // Try to acquire the lock
-            if (atomicCAS(&slot_locks[i], SLOT_FREE, SLOT_ACQUIRED) == SLOT_FREE) {
-                // Double-check the tile ID is still correct
-                if (slot_tile_ids[i] == required_tile_id) {
-                    return i;
-                }
-                // Tile ID changed, release and continue
-                atomicExch(&slot_locks[i], SLOT_FREE);
-            }
-        }
-    }
-    #endif
-    return -1;
-}
-
 // Spin-wait acquire with timeout
 // Returns slot index on success, -1 on timeout
 __device__ __forceinline__ int acquire_shared_slot_spin(int *slot_locks, int num_slots, int spin_limit, int lane_id, int warp_id) {
-    int spin_count = 0;
+    // int spin_count = 0;
     int slot_id = -1;
     while (true) {
         slot_id = acquire_shared_slot(slot_locks, num_slots);
@@ -2659,7 +2654,7 @@ __device__ __forceinline__ int acquire_shared_slot_spin(int *slot_locks, int num
             // printf("Acquire: warp_id = %d, slot_id = %d\n", warp_id, slot_id);
             return slot_id;
         }
-        spin_count++;
+        // spin_count++;
         // if (spin_count > 10000000 && lane_id == 0) printf("spin_count: %d\n", spin_count);
     }
     return -1;  // Timeout
@@ -2678,13 +2673,13 @@ __device__ __forceinline__ int acquire_shared_slot_spin(int *slot_locks, int num
 // NOTE: This kernel uses dynamic shared memory for A/B tiles to fit within 48KB limit
 #if ENABLE_MULTI_WARP_SHARED_SLOT
 
-template <int THREADS_USED = 32>
 __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
                                                                     const int *__restrict__ d_blkcolidxA,
                                                                     int *d_nnzb_A,
                                                                     MAT_VAL_TYPE *d_blkcsr_Val_A,
                                                                     TILE_CSR_COL_TYPE_A *d_blkcsr_Col_A,
                                                                     TILE_CSR_PTR_TYPE *d_blkcsr_Ptr_A,
+                                                                    TILE_MASK_TYPE_A *d_blkmaskA,
                                                                     MAT_VAL_TYPE *d_dense_val_A,
                                                                     int *d_tile_dense_ready_A,
                                                                     int blkmA, int blknA, int numblkA, int nnzA,
@@ -2694,6 +2689,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
                                                                     const MAT_VAL_TYPE *__restrict__ d_blkcsr_Val_B,
                                                                     const TILE_CSR_COL_TYPE_B *__restrict__ d_blkcsr_Col_B,
                                                                     const TILE_CSR_PTR_TYPE *__restrict__ d_blkcsr_Ptr_B,
+                                                                    const TILE_MASK_TYPE_B *__restrict__ d_blkmaskB,
                                                                     MAT_VAL_TYPE *d_dense_val_B,
                                                                     int *d_tile_dense_ready_B,
                                                                     int blkmB, int blknB, int numblkB, int nnzB,
@@ -2712,7 +2708,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
                                                                     int *d_has_dense_calculated)
 {
     const int global_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int global_warp_id = global_id / THREADS_USED;
+    int global_warp_id = global_id / WARP_SIZE;
 
     if (global_warp_id >= numblkC)
         return;
@@ -2724,27 +2720,19 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
         return;
 
     const int total_threads = STEP4_TC_THREADS;
-    const int local_warp_id = threadIdx.x / THREADS_USED;
-    const int num_warps_per_block = total_threads / THREADS_USED;
-    const int c_tile_lane_id = (THREADS_USED - 1) & threadIdx.x;
+    const int local_warp_id = threadIdx.x / WARP_SIZE;
+    const int num_warps_per_block = total_threads / WARP_SIZE;
     const int lane_id = (WARP_SIZE - 1) & threadIdx.x;
 
     // ========== SHARED MEMORY ALLOCATION ==========
-    // C accumulator: per-warp storage (kept small by using register-backed accumulator for Tensor Core)
-    // For TILE_SIZE_M=32, double: 4 warps * 32*32 * 8 bytes = 32KB
     __shared__ MAT_VAL_TYPE s_blkcsr_Val_C[num_warps_per_block * TILE_SIZE_M * TILE_SIZE_M];
-
-    // ========== DYNAMIC SHARED MEMORY FOR SLOT POOL ==========
-    // Use extern shared memory for A/B tile slots to fit within 48KB limit
-    // Layout: [A_slots][B_slots][locks][tile_ids]
-    // Size: NUM_SHARED_SLOTS * (TILE_SIZE_M*TILE_SIZE_N + TILE_SIZE_N*TILE_SIZE_M) * sizeof(MAT_VAL_TYPE)
-    //      + NUM_SHARED_SLOTS * 3 * sizeof(int)
-    extern __shared__ char s_dynamic_buffer[];
-    MAT_VAL_TYPE *s_shared_slots_A = (MAT_VAL_TYPE*)s_dynamic_buffer;
-    MAT_VAL_TYPE *s_shared_slots_B = s_shared_slots_A + NUM_SHARED_SLOTS * TILE_SIZE_M * TILE_SIZE_N;
-    int *s_slot_locks = (int*)(s_shared_slots_B + NUM_SHARED_SLOTS * TILE_SIZE_N * TILE_SIZE_M);
-    int *s_slot_tile_id_A = s_slot_locks + NUM_SHARED_SLOTS;
-    int *s_slot_tile_id_B = s_slot_tile_id_A + NUM_SHARED_SLOTS;
+    __shared__ MAT_VAL_TYPE s_shared_slots_A[NUM_SHARED_SLOTS * TILE_SIZE_M * TILE_SIZE_N];
+    __shared__ MAT_VAL_TYPE s_shared_slots_B[NUM_SHARED_SLOTS * TILE_SIZE_N * TILE_SIZE_M];
+    __shared__ TILE_MASK_TYPE_A s_blkmaskA[num_warps_per_block * TILE_SIZE_M * MaskNumA];
+    __shared__ TILE_MASK_TYPE_B s_blkmaskB[num_warps_per_block * TILE_SIZE_N * MaskNumB];
+    __shared__ int s_slot_locks[NUM_SHARED_SLOTS];
+    __shared__ int s_slot_tile_id_A[NUM_SHARED_SLOTS];
+    __shared__ int s_slot_tile_id_B[NUM_SHARED_SLOTS];
 
     // Intersection results storage
     __shared__ int s_matched_posa[num_warps_per_block * SPECULATIVE_INTERSECTION];
@@ -2774,16 +2762,14 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
 
     // Initialize C accumulator
 #pragma unroll
-    for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
+    for (int c_adaptwarp_idx = lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += WARP_SIZE){
 #pragma unroll
         for (int i = 0; i < TILE_SIZE_M; i++){
             s_blkcsr_Val_C_local[i * TILE_SIZE_M + c_adaptwarp_idx] = 0.0;
         }
     }
 
-    auto g = cg::tiled_partition<THREADS_USED>(cg::this_thread_block());
-
-    if (!c_tile_lane_id)
+    if (!lane_id)
         s_matchedcnt_local[0] = 0;
 
     const int blki = d_blkrowidxC[tilei];
@@ -2811,12 +2797,12 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
                                                    d_blkrowidxB, bbase, bstop, lenb,
                                                    s_matched_posa_local, s_matched_posb_local,
                                                    SPECULATIVE_INTERSECTION, s_matchedcnt_local,
-                                                   c_tile_lane_id, THREADS_USED);
-        g.sync();
+                                                   lane_id, WARP_SIZE);
+        __syncwarp();
         matchedcnt = s_matchedcnt_local[0];
     }
 
-    g.sync();
+    __syncwarp();
 
     if (matchedcnt <= SPECULATIVE_INTERSECTION && specres == 0)
     {
@@ -2850,45 +2836,28 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
                 int dense_idx_B = d_tile_dense_ready_B[bbase + posb];
                 tile_A_ptr = d_dense_val_A + dense_idx_A;
                 tile_B_ptr = d_dense_val_B + dense_idx_B;
+
+#pragma unroll
+                for (int k_step = 0; k_step < TILE_SIZE_N; k_step += WMMA_K){
+#pragma unroll
+                    for (int i = 0; i < NUM_SUBTILES; i++) {
+#pragma unroll
+                        for (int j = 0; j < NUM_SUBTILES; j++) {
+                            const MAT_VAL_TYPE *ptr_a = tile_A_ptr + (i * WMMA_M * TILE_SIZE_N) + k_step;
+                            const MAT_VAL_TYPE *ptr_b = tile_B_ptr + (k_step * TILE_SIZE_M) + (j * WMMA_N);
+                            wmma::load_matrix_sync(a_frag, ptr_a, TILE_SIZE_N);
+                            wmma::load_matrix_sync(b_frag, ptr_b, TILE_SIZE_M);
+                            wmma::mma_sync(c_frag[i][j], a_frag, b_frag, c_frag[i][j]);
+                        }
+                    }
+                }
             } 
             else {
-                // Need to use shared slot for CSR-to-dense conversion
-                // ========== ACQUIRE SLOT (UNIFIED LOCK FOR A AND B) ==========
-                if(c_tile_lane_id == 0){
-                    acquired_slot[local_warp_id] = acquire_shared_slot_spin(s_slot_locks, NUM_SHARED_SLOTS, SLOT_SPIN_LIMIT, c_tile_lane_id, local_warp_id);
+                if(lane_id == 0){
+                    acquired_slot[local_warp_id] = acquire_shared_slot_spin(s_slot_locks, NUM_SHARED_SLOTS, SLOT_SPIN_LIMIT, lane_id, local_warp_id);
                 }
 
                 __syncwarp();
-                // printf("checkpoint1: warp_id = %d, acquired_slot = %d\n", local_warp_id, acquired_slot[local_warp_id]);
-
-                
-                if (acquired_slot[local_warp_id] < 0) {
-                    // Failed to acquire slot - use fallback CSR computation
-                    const int nnzastart = d_nnzb_A[(abase + posa)];
-                    int nnztotala = d_nnzb_A[(abase + posa) + 1] - nnzastart;
-                    const int nnzbstart = ld_gbl_auto(d_nnzb_B + bbase + posb);
-                    int nnztotalb = ld_gbl_auto(d_nnzb_B + bbase + posb + 1) - nnzbstart;
-                    
-                    for (int i = c_tile_lane_id; i < nnztotala; i += THREADS_USED) {
-                        TILE_CSR_COL_TYPE_A rowcolidx = d_blkcsr_Col_A[nnzastart + i];
-                        int rowidxa = rowcolidx / TILE_SIZE_N;
-                        int rowidxb = rowcolidx % TILE_SIZE_N;
-                        MAT_VAL_TYPE val = d_blkcsr_Val_A[nnzastart + i];
-                        
-                        int startb = ld_gbl_auto(d_blkcsr_Ptr_B + (bbase + posb) * TILE_SIZE_N + rowidxb);
-                        int stopb = (rowidxb == TILE_SIZE_N - 1) ? nnztotalb : ld_gbl_auto(d_blkcsr_Ptr_B + (bbase + posb) * TILE_SIZE_N + rowidxb + 1);
-                        
-                        for (int kb = startb; kb < stopb; kb++) {
-                            int colidx = ld_gbl_auto(d_blkcsr_Col_B + nnzbstart + kb);
-                            MAT_VAL_TYPE valb = ld_gbl_auto(d_blkcsr_Val_B + nnzbstart + kb);
-                            s_blkcsr_Val_C_local[rowidxa * TILE_SIZE_M + colidx] += val * valb;
-                        }
-                    }
-                    // printf("checkpoint2: warp_id = %d, acquired_slot = %d\n", local_warp_id, acquired_slot[local_warp_id]);
-                    continue;  // Skip Tensor Core computation
-                }
-
-                // printf("checkpoint3: warp_id = %d, acquired_slot = %d\n", local_warp_id, acquired_slot[local_warp_id]);
 
                 // ========== CONVERT TILES TO DENSE ==========
                 tile_A_ptr = &s_shared_slots_A[acquired_slot[local_warp_id] * TILE_SIZE_M * TILE_SIZE_N];
@@ -2897,72 +2866,71 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
                 if (!a_dense_ready) {
                     const int nnzastart = d_nnzb_A[(abase + posa)];
                     int nnztotala = d_nnzb_A[(abase + posa) + 1] - nnzastart;
-                    csr_tile_to_dense<THREADS_USED>(
+                    bitmask_tile_to_dense(
                         &d_blkcsr_Ptr_A[(abase + posa) * TILE_SIZE_M],
-                        &d_blkcsr_Col_A[nnzastart],
+                        &d_blkmaskA[(abase + posa) * TILE_SIZE_M * MaskNumA],
                         &d_blkcsr_Val_A[nnzastart],
-                        TILE_SIZE_M, TILE_SIZE_N, nnztotala,
-                        tile_A_ptr, TILE_SIZE_N
+                        TILE_SIZE_M,
+                        TILE_SIZE_N,
+                        tile_A_ptr
                     );
                 } else {
                     int dense_idx_A = d_tile_dense_ready_A[abase + posa];
-                    // Copy from global to shared (could optimize by using global directly)
-                    for (int i = c_tile_lane_id; i < TILE_SIZE_M * TILE_SIZE_N; i += THREADS_USED) {
+#pragma unroll
+                    for (int i = lane_id; i < TILE_SIZE_M * TILE_SIZE_N; i += WARP_SIZE) {
                         tile_A_ptr[i] = d_dense_val_A[dense_idx_A + i];
                     }
                 }
-                // printf("checkpoint5: warp_id = %d, acquired_slot = %d\n", local_warp_id, acquired_slot[local_warp_id]);
 
                 if (!b_dense_ready) {
                     const int nnzbstart = ld_gbl_auto(d_nnzb_B + bbase + posb);
                     int nnztotalb = ld_gbl_auto(d_nnzb_B + bbase + posb + 1) - nnzbstart;
-                    csr_tile_to_dense<THREADS_USED>(
+                    bitmask_tile_to_dense(
                         &d_blkcsr_Ptr_B[(bbase + posb) * TILE_SIZE_N],
-                        &d_blkcsr_Col_B[nnzbstart],
+                        &d_blkmaskB[(bbase + posb) * TILE_SIZE_N * MaskNumB],
                         &d_blkcsr_Val_B[nnzbstart],
-                        TILE_SIZE_N, TILE_SIZE_M, nnztotalb,
-                        tile_B_ptr, TILE_SIZE_M
+                        TILE_SIZE_N,
+                        TILE_SIZE_M,
+                        tile_B_ptr
                     );
                 } else {
                     int dense_idx_B = d_tile_dense_ready_B[bbase + posb];
-                    for (int i = c_tile_lane_id; i < TILE_SIZE_N * TILE_SIZE_M; i += THREADS_USED) {
+#pragma unroll
+                    for (int i = lane_id; i < TILE_SIZE_N * TILE_SIZE_M; i += WARP_SIZE) {
                         tile_B_ptr[i] = d_dense_val_B[dense_idx_B + i];
                     }
                 }
 
-                __syncwarp(0xFFFFFFFFu);  // Ensure all threads in warp see the data
-            }
+                __syncwarp();  // Ensure all threads in warp see the data
 
-            // ========== TENSOR CORE COMPUTATION ==========
 #pragma unroll
-            for (int k_step = 0; k_step < TILE_SIZE_N; k_step += WMMA_K){
+                for (int k_step = 0; k_step < TILE_SIZE_N; k_step += WMMA_K){
 #pragma unroll
-                for (int i = 0; i < NUM_SUBTILES; i++) {
+                    for (int i = 0; i < NUM_SUBTILES; i++) {
 #pragma unroll
-                    for (int j = 0; j < NUM_SUBTILES; j++) {
-                        const MAT_VAL_TYPE *ptr_a = tile_A_ptr + (i * WMMA_M * TILE_SIZE_N) + k_step;
-                        const MAT_VAL_TYPE *ptr_b = tile_B_ptr + (k_step * TILE_SIZE_M) + (j * WMMA_N);
+                        for (int j = 0; j < NUM_SUBTILES; j++) {
+                            const MAT_VAL_TYPE *ptr_a = tile_A_ptr + (i * WMMA_M * TILE_SIZE_N) + k_step;
+                            const MAT_VAL_TYPE *ptr_b = tile_B_ptr + (k_step * TILE_SIZE_M) + (j * WMMA_N);
 
-                        wmma::load_matrix_sync(a_frag, ptr_a, TILE_SIZE_N);
-                        wmma::load_matrix_sync(b_frag, ptr_b, TILE_SIZE_M);
-                        wmma::mma_sync(c_frag[i][j], a_frag, b_frag, c_frag[i][j]);
+                            wmma::load_matrix_sync(a_frag, ptr_a, TILE_SIZE_N);
+                            wmma::load_matrix_sync(b_frag, ptr_b, TILE_SIZE_M);
+                            wmma::mma_sync(c_frag[i][j], a_frag, b_frag, c_frag[i][j]);
+                        }
                     }
                 }
-            }
 
-            // ========== RELEASE SLOT ==========
-            if (acquired_slot[local_warp_id] >= 0 && lane_id == 0) {
-                release_shared_slot(s_slot_locks, acquired_slot[local_warp_id], local_warp_id);
-                // printf("Release2: warp_id = %d, slot_id = %d\n", local_warp_id, acquired_slot[local_warp_id]);
+                // ========== RELEASE SLOT ==========
+                if (acquired_slot[local_warp_id] >= 0 && lane_id == 0) {
+                    release_shared_slot(s_slot_locks, acquired_slot[local_warp_id], local_warp_id);
+                }
             }
         }
 
-        // Store results from accumulators
 #pragma unroll
         for(int i=0; i<NUM_SUBTILES; i++) {
 #pragma unroll
             for(int j=0; j<NUM_SUBTILES; j++) {
-                MAT_VAL_TYPE *dst_ptr = s_blkcsr_Val_C_local + (i * 8 * TILE_SIZE_M) + (j * 8);
+                MAT_VAL_TYPE *dst_ptr = s_blkcsr_Val_C_local + (i * sizeof(MAT_VAL_TYPE) * TILE_SIZE_M) + (j * sizeof(MAT_VAL_TYPE));
                 wmma::store_matrix_sync(dst_ptr, c_frag[i][j], TILE_SIZE_M, wmma::mem_row_major);
             }
         }
@@ -3009,7 +2977,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
                 const int nnzbstart = ld_gbl_auto(d_nnzb_B + bbase + posb);
                 int nnztotalb = ld_gbl_auto(d_nnzb_B + bbase + posb + 1) - nnzbstart;
 #pragma unroll
-                for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){   
+                for (int c_adaptwarp_idx = lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += WARP_SIZE){   
                     TILE_CSR_PTR_TYPE offseta_start = d_blkcsr_Ptr_A[(abase + posa) * TILE_SIZE_M + c_adaptwarp_idx];
                     TILE_CSR_PTR_TYPE offseta_end = c_adaptwarp_idx == TILE_SIZE_M - 1 ? nnztotala : d_blkcsr_Ptr_A[(abase + posa) * TILE_SIZE_M + c_adaptwarp_idx + 1];
 
@@ -3042,12 +3010,12 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
         }
     }
 
-    g.sync();
+    __syncwarp();
 
     // Write back results
     if (blknnzctotal == TILE_SIZE_M * TILE_SIZE_M){
 #pragma unroll
-        for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
+        for (int c_adaptwarp_idx = lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += WARP_SIZE){
 #pragma unroll
             for (int i = 0; i < TILE_SIZE_M; i++)
             {
@@ -3062,7 +3030,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
         TILE_CSR_PTR_TYPE blknnzcstart;
 
 #pragma unroll
-        for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
+        for (int c_adaptwarp_idx = lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += WARP_SIZE){
             long long int pos_c = (long long int)(tilei) * TILE_SIZE_M + c_adaptwarp_idx;
             blknnzcstart = d_blkcsr_Ptr_C[pos_c];
 #pragma unroll
@@ -3090,456 +3058,6 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
 }
 
 #endif  // ENABLE_MULTI_WARP_SHARED_SLOT
-
-template <int THREADS_USED = 32>
-__global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core(int *d_blkrowptrA,
-                                                                    const int *__restrict__ d_blkcolidxA,
-                                                                    int *d_nnzb_A,
-                                                                    MAT_VAL_TYPE *d_blkcsr_Val_A,
-                                                                    TILE_CSR_COL_TYPE_A *d_blkcsr_Col_A,
-                                                                    TILE_CSR_PTR_TYPE *d_blkcsr_Ptr_A,
-                                                                    // New Argument: Dense Data A
-                                                                    MAT_VAL_TYPE *d_dense_val_A,
-                                                                    // New Argument: Dense ready flag for A
-                                                                    int *d_tile_dense_ready_A,
-                                                                    int blkmA, int blknA, int numblkA, int nnzA,
-                                                                    const int *__restrict__ d_blkcolptrB,
-                                                                    const int *__restrict__ d_blkrowidxB,
-                                                                    const int *__restrict__ d_nnzb_B,
-                                                                    const MAT_VAL_TYPE *__restrict__ d_blkcsr_Val_B,
-                                                                    const TILE_CSR_COL_TYPE_B *__restrict__ d_blkcsr_Col_B,
-                                                                    const TILE_CSR_PTR_TYPE *__restrict__ d_blkcsr_Ptr_B,
-                                                                    // New Argument: Dense Data B
-                                                                    MAT_VAL_TYPE *d_dense_val_B,
-                                                                    // New Argument: Dense ready flag for B
-                                                                    int *d_tile_dense_ready_B,
-                                                                    int blkmB, int blknB, int numblkB, int nnzB,
-                                                                    int *d_blkrowidxC,
-                                                                    int *d_blkcolidxC,
-                                                                    TILE_CSR_PTR_TYPE *d_blkcsr_Ptr_C,
-                                                                    TILE_CSR_COL_TYPE_B *d_blkcsr_Col_C,
-                                                                    MAT_VAL_TYPE *d_blkcsr_Val_C,
-                                                                    int *d_nnzb_C,
-                                                                    TILE_MASK_TYPE_B *d_blkmaskC,
-                                                                    int numblkC,
-                                                                    int *d_blkid,
-                                                                    int *d_spec_intersection_cnt,
-                                                                    int *d_spec_intersection_posa,
-                                                                    int *d_spec_intersection_posb,
-                                                                    // New Argument: Flag for dense calculation
-                                                                    int *d_has_dense_calculated)
-{
-    const int global_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int global_warp_id = global_id / THREADS_USED;
-
-    if (global_warp_id >= numblkC)
-        return;
-    int tilei = d_blkid[global_warp_id];
-
-    const int nnzcstart = d_nnzb_C[tilei];
-    const int blknnzctotal = d_nnzb_C[tilei + 1] - nnzcstart;
-    if (!blknnzctotal)
-        return;
-
-    const int total_threads = STEP4_TC_THREADS;
-    const int local_warp_id = threadIdx.x / THREADS_USED; 
-    const int num_warps_per_block = total_threads / THREADS_USED;
-    
-    // Ensure Shared Memory is aligned for double precision (8 bytes) or 128-bit vector loads if needed
-    const int shared_val_c_size = num_warps_per_block * TILE_SIZE_M * TILE_SIZE_M * sizeof(MAT_VAL_TYPE);
-
-    // ========== SHARED MEMORY ALLOCATION (OUTSIDE LOOPS) ==========
-    // Accumulator C: per-warp storage for result accumulation
-    #if shared_val_c_size >= 32768
-        MAT_VAL_TYPE s_blkcsr_Val_C[num_warps_per_block * TILE_SIZE_M * TILE_SIZE_M] = {};
-    #else
-        __shared__ MAT_VAL_TYPE s_blkcsr_Val_C[num_warps_per_block * TILE_SIZE_M * TILE_SIZE_M];
-    #endif
-
-    // Slot-based shared memory pool for A and B tiles
-    // Each warp has its own dedicated slot - NO LOCKS NEEDED
-    // Each slot holds one dense tile (TILE_SIZE_M x TILE_SIZE_N for A, TILE_SIZE_N x TILE_SIZE_M for B)
-    // Use num_warps_per_block slots to ensure each warp has its own slot
-    // NOTE: For large tile sizes (TILE_SIZE_M >= 32), we skip shared memory for A/B conversion
-    //       to avoid exceeding shared memory limits. Instead, we use global memory directly.
-#if TILE_SIZE_M < 32
-    __shared__ MAT_VAL_TYPE s_dense_A_slots[num_warps_per_block * TILE_SIZE_M * TILE_SIZE_N];
-    __shared__ MAT_VAL_TYPE s_dense_B_slots[num_warps_per_block * TILE_SIZE_N * TILE_SIZE_M];
-#else
-    // For large tiles, use a smaller buffer for partial conversion if needed
-    // Or rely entirely on global memory for dense data
-    MAT_VAL_TYPE *s_dense_A_slots = nullptr;
-    MAT_VAL_TYPE *s_dense_B_slots = nullptr;
-#endif
-
-    // Intersection results storage
-    __shared__ int s_matched_posa[num_warps_per_block * SPECULATIVE_INTERSECTION];
-    __shared__ int s_matched_posb[num_warps_per_block * SPECULATIVE_INTERSECTION];
-    __shared__ int s_matchedcnt[num_warps_per_block];
-
-    // ========== INITIALIZATION ==========
-    const int c_tile_lane_id = (THREADS_USED - 1) & threadIdx.x;
-    const int lane_id = (WARP_SIZE - 1) & threadIdx.x;
-    
-    // No lock initialization needed - each warp uses its dedicated slot
-    
-    MAT_VAL_TYPE *s_blkcsr_Val_C_local = &s_blkcsr_Val_C[local_warp_id * TILE_SIZE_M * TILE_SIZE_M];
-    int *s_matched_posa_local = &s_matched_posa[local_warp_id * SPECULATIVE_INTERSECTION];
-    int *s_matched_posb_local = &s_matched_posb[local_warp_id * SPECULATIVE_INTERSECTION];
-    int *s_matchedcnt_local = &s_matchedcnt[local_warp_id];
-
-    // Initialize Accumulator C in Shared Memory to 0.0
-#pragma unroll
-    for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
-#pragma unroll
-        for (int i = 0; i < TILE_SIZE_M; i++){
-            s_blkcsr_Val_C_local[i * TILE_SIZE_M + c_adaptwarp_idx] = 0.0;
-        }
-    }
-
-    auto g = cg::tiled_partition<THREADS_USED>(cg::this_thread_block());
-
-    if (!c_tile_lane_id)
-        s_matchedcnt_local[0] = 0;
-
-    const int blki = d_blkrowidxC[tilei];
-    const int blkj = d_blkcolidxC[tilei];
-
-    const int abase = d_blkrowptrA[blki];
-    const int astop = d_blkrowptrA[blki + 1];
-    int lena = astop - abase;
-
-    const int bbase = ld_gbl_auto(d_blkcolptrB + blkj);
-    const int bstop = ld_gbl_auto(d_blkcolptrB + blkj + 1);
-    int lenb = bstop - bbase;
-
-    int matchedcnt = 0;
-    int specres = 0;
-
-    if (USE_GMEM_SPECULATIVE_INTERSECTION)
-        matchedcnt = d_spec_intersection_cnt[tilei];
-
-    if (USE_GMEM_SPECULATIVE_INTERSECTION && matchedcnt > 0)
-    {}
-    else
-    {
-        specres = intersection_binarysearch_kernel(d_blkcolidxA, abase, astop, lena,
-                                                   d_blkrowidxB, bbase, bstop, lenb,
-                                                   s_matched_posa_local, s_matched_posb_local,
-                                                   SPECULATIVE_INTERSECTION, s_matchedcnt_local,
-                                                   c_tile_lane_id, THREADS_USED);
-        
-        g.sync();
-        matchedcnt = s_matchedcnt_local[0];
-    }
-
-    g.sync(); 
-
-    if (matchedcnt <= SPECULATIVE_INTERSECTION && specres == 0)
-    {
-        // Declare Accumulators for the WHOLE tile
-        const int NUM_SUBTILES = TILE_SIZE_M / 8;
-        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE, wmma::row_major> b_frag;
-        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE> c_frag[NUM_SUBTILES + 1][NUM_SUBTILES + 1];
-
-        // Clear Accumulators
-#pragma unroll
-        for(int i = 0; i < NUM_SUBTILES; i++)
-#pragma unroll
-            for(int j = 0; j < NUM_SUBTILES; j++){
-                wmma::fill_fragment(c_frag[i][j], 0.0);
-            }
-
-        // ========== FINE-GRAINED SUB-TILE LOOP WITH DEDICATED SLOTS ==========
-        // Each warp uses its own dedicated slot - NO LOCKS NEEDED
-        // This eliminates deadlock possibility entirely
-        
-        for (int k = 0; k < matchedcnt; k++)
-        {
-            int posa = s_matched_posa_local[k];
-            int posb = s_matched_posb_local[k];
-
-            // Check if dense data is ready for both tiles
-            // FIX: tile_dense_ready >= 0 means dense (0 is valid offset for first dense tile)
-            // tile_dense_ready == -1 means not dense
-            bool a_dense_ready = d_tile_dense_ready_A[abase + posa] >= 0;
-            bool b_dense_ready = d_tile_dense_ready_B[bbase + posb] >= 0;
-            
-            MAT_VAL_TYPE *tile_A_ptr;
-            MAT_VAL_TYPE *tile_B_ptr;
-            
-            if (a_dense_ready && b_dense_ready) {
-                // Both tiles have dense data ready, use directly from global memory
-                // tile_dense_ready stores the actual offset in dense_data array
-                int dense_idx_A = d_tile_dense_ready_A[abase + posa];
-                int dense_idx_B = d_tile_dense_ready_B[bbase + posb];
-                
-                tile_A_ptr = d_dense_val_A + dense_idx_A;
-                tile_B_ptr = d_dense_val_B + dense_idx_B;
-            } 
-#if TILE_SIZE_M < 32
-            else {
-                // At least one tile needs CSR to dense conversion
-                // Only supported for TILE_SIZE_M < 32 due to shared memory constraints
-                const int nnzastart = d_nnzb_A[(abase + posa)];
-                int nnztotala = d_nnzb_A[(abase + posa) + 1] - nnzastart;
-                const int nnzbstart = ld_gbl_auto(d_nnzb_B + bbase + posb);
-                int nnztotalb = ld_gbl_auto(d_nnzb_B + bbase + posb + 1) - nnzbstart;
-                
-                // Convert A tile from CSR to dense if needed
-                if (!a_dense_ready) {
-                    // Use dedicated slot for this warp (no lock needed)
-                    MAT_VAL_TYPE *s_dense_A_local = &s_dense_A_slots[local_warp_id * TILE_SIZE_M * TILE_SIZE_N];
-                    
-                    csr_tile_to_dense<THREADS_USED>(
-                        &d_blkcsr_Ptr_A[(abase + posa) * TILE_SIZE_M],
-                        &d_blkcsr_Col_A[nnzastart],
-                        &d_blkcsr_Val_A[nnzastart],
-                        TILE_SIZE_M, TILE_SIZE_N, nnztotala,
-                        s_dense_A_local, TILE_SIZE_N
-                    );
-                    tile_A_ptr = s_dense_A_local;
-                } else {
-                    // tile_dense_ready stores the actual offset in dense_data array
-                    int dense_idx_A = d_tile_dense_ready_A[abase + posa];
-                    tile_A_ptr = d_dense_val_A + dense_idx_A;
-                }
-                
-                // Convert B tile from CSR to dense if needed
-                if (!b_dense_ready) {
-                    // Use dedicated slot for this warp (no lock needed)
-                    MAT_VAL_TYPE *s_dense_B_local = &s_dense_B_slots[local_warp_id * TILE_SIZE_N * TILE_SIZE_M];
-                    
-                    csr_tile_to_dense<THREADS_USED>(
-                        &d_blkcsr_Ptr_B[(bbase + posb) * TILE_SIZE_N],
-                        &d_blkcsr_Col_B[nnzbstart],
-                        &d_blkcsr_Val_B[nnzbstart],
-                        TILE_SIZE_N, TILE_SIZE_M, nnztotalb,
-                        s_dense_B_local, TILE_SIZE_M
-                    );
-                    tile_B_ptr = s_dense_B_local;
-                } else {
-                    // tile_dense_ready stores the actual offset in dense_data array
-                    int dense_idx_B = d_tile_dense_ready_B[bbase + posb];
-                    tile_B_ptr = d_dense_val_B + dense_idx_B;
-                }
-            }
-#else
-            else {
-                // For large tiles (TILE_SIZE_M >= 32), use CSR-based fallback computation
-                // Cannot use shared memory for CSR-to-dense conversion due to memory constraints
-                // Instead, compute directly using CSR format and accumulate to dense C matrix
-                
-                const int nnzastart = d_nnzb_A[(abase + posa)];
-                int nnztotala = d_nnzb_A[(abase + posa) + 1] - nnzastart;
-                const int nnzbstart = ld_gbl_auto(d_nnzb_B + bbase + posb);
-                int nnztotalb = ld_gbl_auto(d_nnzb_B + bbase + posb + 1) - nnzbstart;
-                
-                // Process A's nonzeros and multiply with corresponding B rows
-                // Each thread processes a subset of A's nonzeros
-                for (int i = c_tile_lane_id; i < nnztotala; i += THREADS_USED) {
-                    TILE_CSR_COL_TYPE_A rowcolidx = d_blkcsr_Col_A[nnzastart + i];
-                    int rowidxa = rowcolidx / TILE_SIZE_N;
-                    int rowidxb = rowcolidx % TILE_SIZE_N;
-                    MAT_VAL_TYPE val = d_blkcsr_Val_A[nnzastart + i];
-                    
-                    // Get B row's range from global memory
-                    int startb = ld_gbl_auto(d_blkcsr_Ptr_B + (bbase + posb) * TILE_SIZE_N + rowidxb);
-                    int stopb = (rowidxb == TILE_SIZE_N - 1) ? nnztotalb : ld_gbl_auto(d_blkcsr_Ptr_B + (bbase + posb) * TILE_SIZE_N + rowidxb + 1);
-                    
-                    // Multiply and accumulate to dense C matrix
-                    for (int k = startb; k < stopb; k++) {
-                        int colidx = ld_gbl_auto(d_blkcsr_Col_B + nnzbstart + k);
-                        MAT_VAL_TYPE valb = ld_gbl_auto(d_blkcsr_Val_B + nnzbstart + k);
-                        // Direct accumulation to dense C (no atomic needed for row-major access)
-                        s_blkcsr_Val_C_local[rowidxa * TILE_SIZE_M + colidx] += val * valb;
-                    }
-                }
-                // Skip Tensor Core computation for this tile pair - already computed via fallback
-                continue;
-            }
-#endif
-
-#pragma unroll
-            for (int k_step = 0; k_step < TILE_SIZE_N; k_step += WMMA_K){
-#pragma unroll
-                for (int i = 0; i < NUM_SUBTILES; i++) {
-#pragma unroll
-                    for (int j = 0; j < NUM_SUBTILES; j++) {
-                        
-                        // 1. Load A Sub-tile (8x8 for double precision WMMA)
-                        // A is TILE_SIZE_M x TILE_SIZE_N, we load 8x8 sub-tiles
-                        // Row_Offset = i * 8, Col_Offset = k_step
-                        const MAT_VAL_TYPE *ptr_a = tile_A_ptr + (i * WMMA_M * TILE_SIZE_N) + k_step;
-                        
-                        // 2. Load B Sub-tile (8x8 for double precision WMMA)
-                        // B is TILE_SIZE_N x TILE_SIZE_M, we load 8x8 sub-tiles
-                        // Row_Offset = k_step, Col_Offset = j * 8
-                        const MAT_VAL_TYPE *ptr_b = tile_B_ptr + (k_step * TILE_SIZE_M) + (j * WMMA_N);
-
-                        // Load Sync: Must be warp-uniform
-                        wmma::load_matrix_sync(a_frag, ptr_a, TILE_SIZE_N);
-                        wmma::load_matrix_sync(b_frag, ptr_b, TILE_SIZE_M);
-
-                        // 3. MMA: C = A * B + C
-                        wmma::mma_sync(c_frag[i][j], a_frag, b_frag, c_frag[i][j]);
-                    }
-                }
-            }
-        }
-
-        // Store results from accumulators to shared memory
-#pragma unroll
-        for(int i=0; i<NUM_SUBTILES; i++) {
-#pragma unroll
-            for(int j=0; j<NUM_SUBTILES; j++) {
-                // Calculate pointer to the specific 8x8 patch in shared mem
-                MAT_VAL_TYPE *dst_ptr = s_blkcsr_Val_C_local + (i * 8 * TILE_SIZE_M) + (j * 8);
-                // IMPORTANT: Pass TILE_SIZE_M as stride, not 8!
-                wmma::store_matrix_sync(dst_ptr, c_frag[i][j], TILE_SIZE_M, wmma::mem_row_major);
-            }
-        }
-        
-    }
-    else
-    {
-        const int astart = d_blkcolidxA[abase];
-        const int aend = d_blkcolidxA[astop - 1];
-        const int bstart = ld_gbl_auto(d_blkrowidxB + bbase);
-        const int bend = ld_gbl_auto(d_blkrowidxB + bstop - 1);
-
-        int posa_real = 0;
-        int posb_real = 0;
-        if (bstart > astart) {
-            int posa_real_new = binary_search_right_boundary_kernel(d_blkcolidxA + abase, bstart, lena);
-            posa_real = posa_real_new < 0 ? 0 : posa_real_new;
-        } else if (bstart < astart) {
-            int posb_real_new = binary_search_right_boundary_kernel(d_blkrowidxB + bbase, astart, lenb);
-            posb_real = posb_real_new < 0 ? 0 : posb_real_new;
-        }
-
-        if (bstop < astop) {
-            int lena_new = binary_search_right_boundary_kernel(d_blkcolidxA + abase, bend, lena) + 1;
-            lena = lena_new > lena ? lena : lena_new;
-        } else if (bstop > astop) {
-            int lenb_new = binary_search_right_boundary_kernel(d_blkrowidxB + bbase, aend, lenb) + 1;
-            lenb = lenb_new > lenb ? lenb : lenb_new;
-        }
-
-        int posa = posa_real;
-        int posb = posb_real;
-        int idxa = 0;
-        int idxb = 0;
-        int posa_updated = 1;
-        int posb_updated = 1;
-        bool has_calc = false; // Track local calculation
-
-        while (posa < lena && posb < lenb)
-        {
-            idxa = posa_updated ? ld_gbl_auto(d_blkcolidxA + abase + posa) : idxa; 
-            idxb = posb_updated ? ld_gbl_auto(d_blkrowidxB + bbase + posb) : idxb; 
-
-            if (idxa == idxb)
-            {
-                const int nnzastart = d_nnzb_A[(abase + posa)];
-                int nnztotala = d_nnzb_A[(abase + posa) + 1] - nnzastart;
-                const TILE_CSR_PTR_TYPE *__restrict__ d_csrRowPtrB = &d_blkcsr_Ptr_B[(bbase + posb) * TILE_SIZE_N];
-                const int nnzbstart = ld_gbl_auto(d_nnzb_B + bbase + posb);
-                int nnztotalb = ld_gbl_auto(d_nnzb_B + bbase + posb + 1) - nnzbstart;
-#pragma unroll
-                for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){   
-                    TILE_CSR_PTR_TYPE offseta_start = d_blkcsr_Ptr_A[(abase + posa) * TILE_SIZE_M + c_adaptwarp_idx];
-                    TILE_CSR_PTR_TYPE offseta_end = c_adaptwarp_idx == TILE_SIZE_M - 1 ? nnztotala : d_blkcsr_Ptr_A[(abase + posa) * TILE_SIZE_M + c_adaptwarp_idx + 1];
-
-                    for (int i = offseta_start; i < offseta_end; i++)
-                    {
-                        TILE_CSR_COL_TYPE_A rowcolidx = d_blkcsr_Col_A[nnzastart + i];
-                        int rowidxa = rowcolidx / TILE_SIZE_N;
-                        int rowidxb = rowcolidx % TILE_SIZE_N;
-                        MAT_VAL_TYPE val = d_blkcsr_Val_A[nnzastart + i];
-
-                        const int startb = ld_gbl_auto(d_csrRowPtrB + rowidxb);
-                        const int stopb = rowidxb == TILE_SIZE_N - 1 ? nnztotalb : ld_gbl_auto(d_csrRowPtrB + rowidxb + 1);
-                        for (int k = startb; k < stopb; k++)
-                        {
-                            TILE_CSR_COL_TYPE_B colidx = ld_gbl_auto(d_blkcsr_Col_B + nnzbstart + k);
-                            MAT_VAL_TYPE valb = ld_gbl_auto(d_blkcsr_Val_B + nnzbstart + k);
-                            s_blkcsr_Val_C_local[rowidxa * TILE_SIZE_M + colidx] += val * valb;
-                        }
-                    }
-                }
-
-                posa++;
-                posa_updated = 1;
-                posb++;
-                posb_updated = 1;
-            }
-            else
-            {
-                posa_updated = idxa < idxb ? 1 : 0;
-                posa += posa_updated;
-                posb_updated = idxa > idxb ? 1 : 0;
-                posb += posb_updated;
-            }
-        }
-        
-        // Need to ensure all threads agree on updating the global flag
-        // However, 'has_calc' might be divergent here depending on loop path.
-        // It's safer to not update the flag in the fallback path or use ballot logic.
-        // For now, only the main dense path updates the flag.
-    }
-
-    // ... (Remainder of the function: Sparse write-back to Global Memory) ...
-    // Note: Ensure you have g.sync() before reading s_blkcsr_Val_C_local for the write-back phase
-    g.sync();
-
-    // Check
-    if (blknnzctotal == TILE_SIZE_M * TILE_SIZE_M){
-#pragma unroll
-        for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
-#pragma unroll
-            for (int i = 0; i < TILE_SIZE_M; i++)
-            {
-                int offset_local = i * TILE_SIZE_M + c_adaptwarp_idx;
-                d_blkcsr_Col_C[nnzcstart + offset_local] = c_adaptwarp_idx;
-                d_blkcsr_Val_C[nnzcstart + offset_local] = s_blkcsr_Val_C_local[offset_local];
-            }
-        }
-    }
-    else{
-        // Sparse write-back
-        const int ADAPTWARP_PER_TILE = (TILE_SIZE_M + THREADS_USED - 1) / THREADS_USED;
-        TILE_MASK_TYPE_B maskc[MaskNumC] = {};
-        TILE_CSR_PTR_TYPE blknnzcstart;
-
-#pragma unroll
-        for (int c_adaptwarp_idx = c_tile_lane_id; c_adaptwarp_idx < TILE_SIZE_M; c_adaptwarp_idx += THREADS_USED){
-            long long int pos_c = (long long int)(tilei) * TILE_SIZE_M + c_adaptwarp_idx;
-            blknnzcstart = d_blkcsr_Ptr_C[pos_c];
-#pragma unroll
-            for (int maskid = 0; maskid < MaskNumC; maskid++){
-                maskc[maskid] = d_blkmaskC[pos_c * MaskNumC + maskid];
-            }
-
-            int cnt = 0;
-#pragma unroll
-            for (int maskid = 0; maskid < MaskNumC; maskid++){
-#pragma unroll
-                for (int i = 0; i < MaskBitsC; i++)
-                {
-                    int idx = ((maskc[maskid] >> MaskBitsC - i - 1) & 0x1) == 1 ? (maskid * MaskBitsC) + i : -1;
-                    if (idx != -1)
-                    {
-                        d_blkcsr_Col_C[nnzcstart + blknnzcstart + cnt] = idx;
-                        d_blkcsr_Val_C[nnzcstart + blknnzcstart + cnt] = s_blkcsr_Val_C_local[c_adaptwarp_idx * TILE_SIZE_M + idx];
-                        cnt++;
-                    }
-                }
-            }
-        }
-    }
-}
 
 void tilespgemm(SMatrixA *matrixA,
                 SMatrixB *matrixB,
@@ -4060,38 +3578,21 @@ void tilespgemm(SMatrixA *matrixA,
     // dns : 129 - dns
     if (blksmem_dns_cnt)
     {
-        #if ENABLE_MULTI_WARP_SHARED_SLOT
+        #if ENABLE_MULTI_WARP_SHARED_SLOT && TILE_SIZE_M <= 32 && TILE_SIZE_N <=32
         // Use shared slot kernel for better memory efficiency
         num_threads = STEP4_TC_THREADS;
-        num_blocks = ceil((double)blksmem_dns_cnt / (double)(num_threads / THREADS_USED_DNS));
+        num_blocks = ceil((double)blksmem_dns_cnt / (double)(num_threads / WARP_SIZE));
         // Calculate dynamic shared memory size for the shared slot kernel
         // Layout: [A_slots][B_slots][locks][tile_id_A][tile_id_B]
         constexpr size_t dynamic_smem_size = NUM_SHARED_SLOTS * TILE_SIZE_M * TILE_SIZE_N * sizeof(MAT_VAL_TYPE)  // A slots
                                  + NUM_SHARED_SLOTS * TILE_SIZE_N * TILE_SIZE_M * sizeof(MAT_VAL_TYPE)  // B slots
                                  + NUM_SHARED_SLOTS * 3 * sizeof(int);  // locks + tile_id_A + tile_id_B
-        tile_spgemm_step4_cuda_dns_kernel_shared_slot<THREADS_USED_DNS><<<num_blocks, num_threads, dynamic_smem_size, streams[3]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A, d_blkcsr_Col_A, d_blkcsr_Ptr_A,
-                                                                                                                    d_dense_val_A,
+        tile_spgemm_step4_cuda_dns_kernel_shared_slot<<<num_blocks, num_threads, 0, streams[3]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A, d_blkcsr_Col_A, d_blkcsr_Ptr_A,
+                                                                                                                    d_blkmaskA, d_dense_val_A,
                                                                                                                     d_tile_dense_ready_A,
                                                                                                                     blkmA, blknA, numblkA, nnzA,
                                                                                                                     d_blkcolptrB, d_blkrowidxB, d_nnzb_B, d_blkcsr_Val_B, d_blkcsr_Col_B, d_blkcsr_Ptr_B,
-                                                                                                                    d_dense_val_B,
-                                                                                                                    d_tile_dense_ready_B,
-                                                                                                                    blkmB, blknB, numblkB, nnzB,
-                                                                                                                    d_blkrowidxC, d_blkcolidxC, d_blkcsr_Ptr_C,
-                                                                                                                    d_blkcsr_Col_C, d_blkcsr_Val_C,
-                                                                                                                    d_nnzb_C, d_blkmaskC, blksmem_dns_cnt, d_blkid_smem_dns,
-                                                                                                                    d_spec_intersection_cnt, d_spec_intersection_posa, d_spec_intersection_posb,
-                                                                                                                    d_has_dense_calculated);
-        #elif USE_TENSORCORE
-        // Use tensor core kernel with dedicated slots per warp
-        num_threads = STEP4_TC_THREADS;
-        num_blocks = ceil((double)blksmem_dns_cnt / (double)(num_threads / THREADS_USED_DNS));
-        tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[3]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A,  d_blkcsr_Col_A, d_blkcsr_Ptr_A,
-                                                                                                                    d_dense_val_A,
-                                                                                                                    d_tile_dense_ready_A,
-                                                                                                                    blkmA, blknA, numblkA, nnzA,
-                                                                                                                    d_blkcolptrB, d_blkrowidxB, d_nnzb_B, d_blkcsr_Val_B, d_blkcsr_Col_B, d_blkcsr_Ptr_B,
-                                                                                                                    d_dense_val_B,
+                                                                                                                    d_blkmaskB, d_dense_val_B,
                                                                                                                     d_tile_dense_ready_B,
                                                                                                                     blkmB, blknB, numblkB, nnzB,
                                                                                                                     d_blkrowidxC, d_blkcolidxC, d_blkcsr_Ptr_C,
@@ -4117,38 +3618,21 @@ void tilespgemm(SMatrixA *matrixA,
     // ful : 256
     if (blksmem_ful_cnt)
     {
-        #if ENABLE_MULTI_WARP_SHARED_SLOT
+        #if ENABLE_MULTI_WARP_SHARED_SLOT && TILE_SIZE_M <= 32 && TILE_SIZE_N <=32
         // Use shared slot kernel for better memory efficiency
         num_threads = STEP4_TC_THREADS;
-        num_blocks = ceil((double)blksmem_ful_cnt / (double)(num_threads / THREADS_USED_DNS));
+        num_blocks = ceil((double)blksmem_ful_cnt / (double)(num_threads / WARP_SIZE));
         // Calculate dynamic shared memory size for the shared slot kernel
         // Layout: [A_slots][B_slots][locks][tile_id_A][tile_id_B]
         constexpr size_t dynamic_smem_size_ful = NUM_SHARED_SLOTS * TILE_SIZE_M * TILE_SIZE_N * sizeof(MAT_VAL_TYPE)  // A slots
                                      + NUM_SHARED_SLOTS * TILE_SIZE_N * TILE_SIZE_M * sizeof(MAT_VAL_TYPE)  // B slots
                                      + NUM_SHARED_SLOTS * 3 * sizeof(int);  // locks + tile_id_A + tile_id_B
-        tile_spgemm_step4_cuda_dns_kernel_shared_slot<THREADS_USED_DNS><<<num_blocks, num_threads, dynamic_smem_size_ful, streams[4]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A, d_blkcsr_Col_A, d_blkcsr_Ptr_A,
-                                                                                                                    d_dense_val_A,
+        tile_spgemm_step4_cuda_dns_kernel_shared_slot<<<num_blocks, num_threads, 0, streams[4]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A, d_blkcsr_Col_A, d_blkcsr_Ptr_A,
+                                                                                                                    d_blkmaskA, d_dense_val_A,
                                                                                                                     d_tile_dense_ready_A,
                                                                                                                     blkmA, blknA, numblkA, nnzA,
                                                                                                                     d_blkcolptrB, d_blkrowidxB, d_nnzb_B, d_blkcsr_Val_B, d_blkcsr_Col_B, d_blkcsr_Ptr_B,
-                                                                                                                    d_dense_val_B,
-                                                                                                                    d_tile_dense_ready_B,
-                                                                                                                    blkmB, blknB, numblkB, nnzB,
-                                                                                                                    d_blkrowidxC, d_blkcolidxC, d_blkcsr_Ptr_C,
-                                                                                                                    d_blkcsr_Col_C, d_blkcsr_Val_C,
-                                                                                                                    d_nnzb_C, d_blkmaskC, blksmem_ful_cnt, d_blkid_smem_ful,
-                                                                                                                    d_spec_intersection_cnt, d_spec_intersection_posa, d_spec_intersection_posb,
-                                                                                                                    d_has_dense_calculated);
-        #elif USE_TENSORCORE
-        // Use tensor core kernel with dedicated slots per warp
-        num_threads = STEP4_TC_THREADS;
-        num_blocks = ceil((double)blksmem_ful_cnt / (double)(num_threads / THREADS_USED_DNS));
-        tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[4]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A,  d_blkcsr_Col_A, d_blkcsr_Ptr_A,
-                                                                                                                    d_dense_val_A,
-                                                                                                                    d_tile_dense_ready_A,
-                                                                                                                    blkmA, blknA, numblkA, nnzA,
-                                                                                                                    d_blkcolptrB, d_blkrowidxB, d_nnzb_B, d_blkcsr_Val_B, d_blkcsr_Col_B, d_blkcsr_Ptr_B,
-                                                                                                                    d_dense_val_B,
+                                                                                                                    d_blkmaskB, d_dense_val_B,
                                                                                                                     d_tile_dense_ready_B,
                                                                                                                     blkmB, blknB, numblkB, nnzB,
                                                                                                                     d_blkrowidxC, d_blkcolidxC, d_blkcsr_Ptr_C,

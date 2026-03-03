@@ -29,11 +29,11 @@
 
 // e.g., nvcc -DTILE_SIZE_M=64 ...
 #ifndef TILE_SIZE_M
-#define TILE_SIZE_M 32
+#define TILE_SIZE_M 8
 #endif
 
 #ifndef TILE_SIZE_N
-#define TILE_SIZE_N 32
+#define TILE_SIZE_N 8
 #endif
 
 // WMMA fragment dimensions for Double Precision (FP64)
@@ -169,7 +169,7 @@
 #define STEP3_THREADS 128
 #define STEP4_THREADS 128
 #if TILE_SIZE_M >= 32
-    #define STEP4_TC_THREADS 32
+    #define STEP4_TC_THREADS 64
 #else
     #define STEP4_TC_THREADS 128
 #endif
@@ -253,10 +253,10 @@ typedef uint32_t INTERSEC_BITMASK_TYPE;
 // For TILE_SIZE_M=32, double precision: each slot ~ 16KB (A:8KB + B:8KB)
 // IMPORTANT: For large tiles (TILE_SIZE_M >= 32), use 1 slot to fit in 48KB shared memory
 #ifndef NUM_SHARED_SLOTS
-    #if TILE_SIZE_M < 32
+    #if TILE_SIZE_M < 32 && TILE_SIZE_N < 32
         #define NUM_SHARED_SLOTS 4
     #else
-        #define NUM_SHARED_SLOTS 2
+        #define NUM_SHARED_SLOTS 1
     #endif
 #endif
 
