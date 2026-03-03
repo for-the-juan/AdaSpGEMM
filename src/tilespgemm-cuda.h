@@ -2323,7 +2323,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp(int *d_blkrowptr
     if (!blknnzctotal)
         return;
 
-    const int total_threads = STEP4_THREADS;
+    const int total_threads = STEP4_TC_THREADS;
     const int local_warp_id = threadIdx.x / THREADS_USED; //threadIdx.x / HALFWARP_SIZE;
     
     const int shared_val_c_size = total_threads / THREADS_USED * TILE_SIZE_M * TILE_SIZE_M * sizeof(MAT_VAL_TYPE);
@@ -2592,15 +2592,6 @@ __device__ __forceinline__ void csr_tile_to_dense(const RowPtrT  *__restrict__ c
     __syncwarp(mask);
 }
 
-// Slot-based shared memory pool constants
-// Use configurable slot counts from common.h
-// Each slot can hold one dense tile for A or B
-constexpr int NUM_SLOTS_A = NUM_DENSE_SLOTS_A;
-constexpr int NUM_SLOTS_B = NUM_DENSE_SLOTS_B;
-
-// Total slots (for backward compatibility, use max of A and B)
-constexpr int NUM_SLOTS = (NUM_SLOTS_A > NUM_SLOTS_B) ? NUM_SLOTS_A : NUM_SLOTS_B;
-
 // Slot lock states
 #define SLOT_FREE 0
 #define SLOT_ACQUIRED 1
@@ -2608,14 +2599,6 @@ constexpr int NUM_SLOTS = (NUM_SLOTS_A > NUM_SLOTS_B) ? NUM_SLOTS_A : NUM_SLOTS_
 // ==================== Multi-Warp Shared Slot Helper Functions ====================
 
 #if ENABLE_MULTI_WARP_SHARED_SLOT
-
-// Unified slot structure for both A and B tiles
-// This prevents deadlock by acquiring A and B space together
-struct SharedSlotInfo {
-    int tile_id_A;      // Current A tile stored in slot (-1 = empty)
-    int tile_id_B;      // Current B tile stored in slot (-1 = empty)
-    int lock;           // Unified lock: 0 = free, 1 = acquired
-};
 
 // Acquire a slot from the shared pool
 // Returns slot index on success, -1 if no slot available
@@ -2669,8 +2652,6 @@ __device__ __forceinline__ int find_cached_tile_slot(
 __device__ __forceinline__ int acquire_shared_slot_spin(int *slot_locks, int num_slots, int spin_limit, int lane_id, int warp_id) {
     int spin_count = 0;
     int slot_id = -1;
-    
-    // while (spin_count < spin_limit) {
     while (true) {
         slot_id = acquire_shared_slot(slot_locks, num_slots);
         if (slot_id >= 0) {
@@ -2686,55 +2667,6 @@ __device__ __forceinline__ int acquire_shared_slot_spin(int *slot_locks, int num
 
 #endif  // ENABLE_MULTI_WARP_SHARED_SLOT
 
-// ==================== End Multi-Warp Shared Slot Helper Functions ====================
-
-// ========== COMPUTE SHARED MEMORY REQUIREMENTS ==========
-// Calculate shared memory needed for different tile configurations
-constexpr size_t SMEM_PER_WARP_C = TILE_SIZE_M * TILE_SIZE_M * sizeof(MAT_VAL_TYPE);
-constexpr size_t SMEM_PER_SLOT_A = TILE_SIZE_M * TILE_SIZE_N * sizeof(MAT_VAL_TYPE);
-constexpr size_t SMEM_PER_SLOT_B = TILE_SIZE_N * TILE_SIZE_M * sizeof(MAT_VAL_TYPE);
-
-// Total shared memory per warp (C accumulator + A slot + B slot)
-constexpr size_t SMEM_PER_WARP_TOTAL = SMEM_PER_WARP_C + SMEM_PER_SLOT_A + SMEM_PER_SLOT_B;
-
-// Maximum warps per block based on shared memory limit
-constexpr int MAX_WARPS_PER_BLOCK_SMEM = MAX_SMEM_PER_BLOCK / SMEM_PER_WARP_TOTAL;
-
-// Actual warps per block (limited by both threads and shared memory)
-constexpr int ACTUAL_WARPS_PER_BLOCK = 
-    (STEP4_THREADS / 32) < MAX_WARPS_PER_BLOCK_SMEM ? (STEP4_THREADS / 32) : MAX_WARPS_PER_BLOCK_SMEM;
-
-// Check if we need sub-tile splitting due to shared memory constraints
-constexpr bool NEEDS_SUBTILE_SPLIT = (SMEM_PER_WARP_TOTAL > MAX_SMEM_PER_BLOCK);
-
-// ========== SUB-TILE K DIMENSION CALCULATION ==========
-// If shared memory is insufficient, calculate required K step size
-// K step must be divisible by WMMA_K (4 for FP64)
-constexpr int CALCULATE_SUBTILE_K_STEP() {
-    if (!NEEDS_SUBTILE_SPLIT) return TILE_SIZE_N;
-    
-    // Calculate how much shared memory we have available per warp
-    size_t available_smem_per_warp = MAX_SMEM_PER_BLOCK / (STEP4_THREADS / 32);
-    
-    // Subtract C accumulator size
-    size_t available_for_AB = available_smem_per_warp - SMEM_PER_WARP_C;
-    
-    // Calculate K dimension that fits in available memory
-    // A needs: TILE_SIZE_M * K_STEP * sizeof(MAT_VAL_TYPE)
-    // B needs: K_STEP * TILE_SIZE_M * sizeof(MAT_VAL_TYPE)
-    // Total: 2 * TILE_SIZE_M * K_STEP * sizeof(MAT_VAL_TYPE)
-    size_t k_step_bytes = available_for_AB / (2 * TILE_SIZE_M);
-    int k_step = k_step_bytes / sizeof(MAT_VAL_TYPE);
-    
-    // Round down to nearest WMMA_K multiple
-    k_step = (k_step / WMMA_K) * WMMA_K;
-    
-    // Ensure at least WMMA_K
-    return k_step >= WMMA_K ? k_step : WMMA_K;
-}
-
-// Effective K step size for sub-tile processing
-constexpr int EFFECTIVE_SUBTILE_K_STEP = CALCULATE_SUBTILE_K_STEP();
 
 // ========== SIMPLIFIED SLOT MANAGEMENT (NO LOCKS) ==========
 // Each warp has a dedicated slot indexed by local_warp_id
@@ -2791,7 +2723,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
     if (!blknnzctotal)
         return;
 
-    const int total_threads = STEP4_THREADS;
+    const int total_threads = STEP4_TC_THREADS;
     const int local_warp_id = threadIdx.x / THREADS_USED;
     const int num_warps_per_block = total_threads / THREADS_USED;
     const int c_tile_lane_id = (THREADS_USED - 1) & threadIdx.x;
@@ -3003,7 +2935,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
 
             // ========== TENSOR CORE COMPUTATION ==========
 #pragma unroll
-            for (int k_step = 0; k_step < TILE_SIZE_N; k_step += EFFECTIVE_SUBTILE_K_STEP){
+            for (int k_step = 0; k_step < TILE_SIZE_N; k_step += WMMA_K){
 #pragma unroll
                 for (int i = 0; i < NUM_SUBTILES; i++) {
 #pragma unroll
@@ -3209,7 +3141,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core(int 
     if (!blknnzctotal)
         return;
 
-    const int total_threads = STEP4_THREADS;
+    const int total_threads = STEP4_TC_THREADS;
     const int local_warp_id = threadIdx.x / THREADS_USED; 
     const int num_warps_per_block = total_threads / THREADS_USED;
     
@@ -3429,13 +3361,8 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core(int 
             }
 #endif
 
-            // ========== TENSOR CORE SUB-TILE COMPUTATION ==========
-            // Fine-grained loop over K dimension for better memory access patterns
-            // Use EFFECTIVE_SUBTILE_K_STEP for shared memory-aware sub-tile processing
-            // When shared memory is sufficient, EFFECTIVE_SUBTILE_K_STEP == TILE_SIZE_N (single iteration)
-            // When shared memory is limited, multiple iterations process K in smaller chunks
 #pragma unroll
-            for (int k_step = 0; k_step < TILE_SIZE_N; k_step += EFFECTIVE_SUBTILE_K_STEP){
+            for (int k_step = 0; k_step < TILE_SIZE_N; k_step += WMMA_K){
 #pragma unroll
                 for (int i = 0; i < NUM_SUBTILES; i++) {
 #pragma unroll
@@ -4135,7 +4062,7 @@ void tilespgemm(SMatrixA *matrixA,
     {
         #if ENABLE_MULTI_WARP_SHARED_SLOT
         // Use shared slot kernel for better memory efficiency
-        num_threads = STEP4_THREADS;
+        num_threads = STEP4_TC_THREADS;
         num_blocks = ceil((double)blksmem_dns_cnt / (double)(num_threads / THREADS_USED_DNS));
         // Calculate dynamic shared memory size for the shared slot kernel
         // Layout: [A_slots][B_slots][locks][tile_id_A][tile_id_B]
@@ -4157,7 +4084,7 @@ void tilespgemm(SMatrixA *matrixA,
                                                                                                                     d_has_dense_calculated);
         #elif USE_TENSORCORE
         // Use tensor core kernel with dedicated slots per warp
-        num_threads = STEP4_THREADS;
+        num_threads = STEP4_TC_THREADS;
         num_blocks = ceil((double)blksmem_dns_cnt / (double)(num_threads / THREADS_USED_DNS));
         tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[3]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A,  d_blkcsr_Col_A, d_blkcsr_Ptr_A,
                                                                                                                     d_dense_val_A,
@@ -4174,7 +4101,7 @@ void tilespgemm(SMatrixA *matrixA,
                                                                                                                     d_has_dense_calculated);
         #else
         // Fallback to basic dense kernel
-        num_threads = STEP4_THREADS;
+        num_threads = STEP4_TC_THREADS;
         num_blocks = ceil((double)blksmem_dns_cnt / (double)(num_threads / THREADS_USED_DNS));
         tile_spgemm_step4_cuda_dns_kernel_adaptive_warp<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[3]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A, d_blkcsr_Col_A, d_blkcsr_Ptr_A,
                                                                                                         blkmA, blknA, numblkA, nnzA,
@@ -4192,7 +4119,7 @@ void tilespgemm(SMatrixA *matrixA,
     {
         #if ENABLE_MULTI_WARP_SHARED_SLOT
         // Use shared slot kernel for better memory efficiency
-        num_threads = STEP4_THREADS;
+        num_threads = STEP4_TC_THREADS;
         num_blocks = ceil((double)blksmem_ful_cnt / (double)(num_threads / THREADS_USED_DNS));
         // Calculate dynamic shared memory size for the shared slot kernel
         // Layout: [A_slots][B_slots][locks][tile_id_A][tile_id_B]
@@ -4214,7 +4141,7 @@ void tilespgemm(SMatrixA *matrixA,
                                                                                                                     d_has_dense_calculated);
         #elif USE_TENSORCORE
         // Use tensor core kernel with dedicated slots per warp
-        num_threads = STEP4_THREADS;
+        num_threads = STEP4_TC_THREADS;
         num_blocks = ceil((double)blksmem_ful_cnt / (double)(num_threads / THREADS_USED_DNS));
         tile_spgemm_step4_cuda_dns_kernel_adaptive_warp_tensor_core<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[4]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A,  d_blkcsr_Col_A, d_blkcsr_Ptr_A,
                                                                                                                     d_dense_val_A,
@@ -4231,7 +4158,7 @@ void tilespgemm(SMatrixA *matrixA,
                                                                                                                     d_has_dense_calculated);
         #else
         // Fallback to basic dense kernel
-        num_threads = STEP4_THREADS;
+        num_threads = STEP4_TC_THREADS;
         num_blocks = ceil((double)blksmem_ful_cnt / (double)(num_threads / THREADS_USED_DNS));
         tile_spgemm_step4_cuda_dns_kernel_adaptive_warp<THREADS_USED_DNS><<<num_blocks, num_threads, 0, streams[4]>>>(d_blkrowptrA, d_blkcolidxA, d_nnzb_A, d_blkcsr_Val_A, d_blkcsr_Col_A, d_blkcsr_Ptr_A,
                                                                                                         blkmA, blknA, numblkA, nnzA,

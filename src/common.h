@@ -168,6 +168,11 @@
 
 #define STEP3_THREADS 128
 #define STEP4_THREADS 128
+#if TILE_SIZE_M >= 32
+    #define STEP4_TC_THREADS 32
+#else
+    #define STEP4_TC_THREADS 128
+#endif
 
 // ---------------------- Tile 类型定义 ----------------------
 #if TILE_SIZE_M * TILE_SIZE_N <= 256 && TILE_SIZE_M * TILE_SIZE_M <= 256
@@ -225,19 +230,6 @@ typedef uint32_t INTERSEC_BITMASK_TYPE;
 
 // ==================== Dense Tile Optimization Configuration ====================
 
-// Number of shared memory slots for dense tile conversion
-// Each slot can hold one TILE_SIZE_M x TILE_SIZE_N (A) or TILE_SIZE_N x TILE_SIZE_M (B) tile
-// IMPORTANT: Reduce slots to fit within shared memory limits
-// For TILE_SIZE_M=16: each slot = 16*16*8 = 2KB (double precision)
-// Total shared memory per block should be < 48KB
-#ifndef NUM_DENSE_SLOTS_A
-#define NUM_DENSE_SLOTS_A 1  // Slots for Matrix A tiles (1 slot per warp group)
-#endif
-
-#ifndef NUM_DENSE_SLOTS_B
-#define NUM_DENSE_SLOTS_B 1  // Slots for Matrix B tiles (1 slot per warp group)
-#endif
-
 // Enable slot lock mechanism for dynamic slot allocation
 // When disabled, each warp uses its dedicated slot (no contention, but limited slots)
 // When enabled, warps can acquire/release slots dynamically (more flexible, but has lock overhead)
@@ -261,7 +253,11 @@ typedef uint32_t INTERSEC_BITMASK_TYPE;
 // For TILE_SIZE_M=32, double precision: each slot ~ 16KB (A:8KB + B:8KB)
 // IMPORTANT: For large tiles (TILE_SIZE_M >= 32), use 1 slot to fit in 48KB shared memory
 #ifndef NUM_SHARED_SLOTS
-#define NUM_SHARED_SLOTS 4
+    #if TILE_SIZE_M < 32
+        #define NUM_SHARED_SLOTS 4
+    #else
+        #define NUM_SHARED_SLOTS 2
+    #endif
 #endif
 
 // Spin wait limit for slot acquisition (to prevent infinite loops)
