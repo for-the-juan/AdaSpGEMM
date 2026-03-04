@@ -480,7 +480,7 @@ void csr2tile_row_major(SMatrixA *matrix, int tile_size_m, int tile_size_n)
     // Step: Count dense tiles and allocate dense_data space
     // Calculate threshold for dense tile (nnz >= threshold * tile_size_m * tile_size_n)
     int tile_total_elems = tile_size_m * tile_size_n;
-    int dense_threshold = (int)(TILE_DENSE_THRESHOLD * tile_total_elems);
+    int dense_threshold = (int)((float)(TILE_DENSE_THRESHOLD) / 10 * (float)tile_total_elems);
     
     // Allocate tile_dense_ready array, initialize to -1 (not dense)
     matrix->tile_dense_ready = (int *)malloc(matrix->numtile * sizeof(int));
@@ -642,7 +642,7 @@ void csr2tile_col_major(SMatrixB *matrix, int tile_size_m, int tile_size_n)
     // Step: Count dense tiles and allocate dense_data space for Matrix B
     // Calculate threshold for dense tile (nnz >= threshold * tile_size_n * tile_size_m)
     int tile_total_elems_B = tile_size_n * tile_size_m;
-    int dense_threshold_B = (int)(TILE_DENSE_THRESHOLD * tile_total_elems_B);
+    int dense_threshold_B = (int)((float)(TILE_DENSE_THRESHOLD) / 10 * (float)tile_total_elems_B);
     
     // Allocate tile_dense_ready array, initialize to -1 (not dense)
     matrix->tile_dense_ready = (int *)malloc(matrix->numtile * sizeof(int));

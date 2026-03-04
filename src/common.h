@@ -153,7 +153,7 @@
 #define SMEM_SML_TH (TILE_SIZE_M * TILE_SIZE_M / 8)
 
 #ifndef SMEM_LRG_TH
-#define SMEM_LRG_TH (TILE_SIZE_M * TILE_SIZE_M * 7 / 8)
+#define SMEM_LRG_TH (TILE_SIZE_M * TILE_SIZE_M * 2 / 8)
 #endif
 
 #define SMEM_DNS_TH (TILE_SIZE_M * TILE_SIZE_M)
@@ -168,7 +168,7 @@
 
 #define STEP3_THREADS 128
 #define STEP4_THREADS 128
-#if TILE_SIZE_M >= 32
+#if TILE_SIZE_M == 32 && TILE_SIZE_N == 32
     #define STEP4_TC_THREADS 64
 #else
     #define STEP4_TC_THREADS 128
@@ -225,7 +225,7 @@ typedef uint32_t INTERSEC_BITMASK_TYPE;
 #define MaskNumC (TILE_SIZE_M / MaskBitsC) // tile_size_k
 
 #ifndef TILE_DENSE_THRESHOLD
-#define TILE_DENSE_THRESHOLD 1
+#define TILE_DENSE_THRESHOLD 7
 #endif
 
 // ==================== Dense Tile Optimization Configuration ====================
@@ -254,7 +254,7 @@ typedef uint32_t INTERSEC_BITMASK_TYPE;
 // IMPORTANT: For large tiles (TILE_SIZE_M >= 32), use 1 slot to fit in 48KB shared memory
 #ifndef NUM_SHARED_SLOTS
     #if TILE_SIZE_M < 32 && TILE_SIZE_N < 32
-        #define NUM_SHARED_SLOTS 4
+        #define NUM_SHARED_SLOTS 2
     #else
         #define NUM_SHARED_SLOTS 1
     #endif

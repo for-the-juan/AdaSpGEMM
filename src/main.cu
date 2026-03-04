@@ -179,12 +179,12 @@ double csr_mem = CSR_bytes /1024/1024;
 
 printf("tile space overhead = %.2f MB\n", mem);
 
-double dense_bytes = (long long int)matrixA->numtile * TILE_SIZE_M * TILE_SIZE_N * sizeof(MAT_VAL_TYPE) + 
-                     (long long int)matrixA->numtile * TILE_SIZE_M * TILE_SIZE_N * sizeof(bool);
+double dense_bytes = (long long int)matrixA->dense_tile_count * TILE_SIZE_M * TILE_SIZE_N * sizeof(MAT_VAL_TYPE) + 
+                     (long long int)matrixA->dense_tile_count * sizeof(int);
 double dense_mem = dense_bytes /1024/1024;
 
 printf("CSR space overhead = %.2f MB\n", csr_mem);
-printf("Dense space overhead = %.2f MB\n", dense_mem);
+printf("Dense space overhead = %.2f MB, DNS_THRESHOLD = %.2f\n", dense_mem, float(TILE_DENSE_THRESHOLD)/10);
 
 #endif
 
