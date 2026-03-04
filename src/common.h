@@ -43,20 +43,7 @@
 
 #define QUADWARP_SIZE 8
 #define HALFWARP_SIZE 16
-// #if TILE_SIZE_M * TILE_SIZE_M <= 8 * 16 * 16
-//     #define HALFWARP_PER_BLOCK (8 * 16 * 16 / TILE_SIZE_M / TILE_SIZE_M)
-//     // #define HALFWARP_PER_BLOCK 8
-// #else
-//     #define HALFWARP_PER_BLOCK 1
-// #endif
-
 #define WARP_SIZE 32
-// #if TILE_SIZE_M * TILE_SIZE_M <= 4 * 16 * 16
-//     #define WARP_PER_BLOCK (4 * 16 * 16 / TILE_SIZE_M / TILE_SIZE_M)
-//     // #define WARP_PER_BLOCK 4
-// #else
-//     #define WARP_PER_BLOCK 1
-// #endif
 
 #define QUADWARP_PER_BLOCK 16
 #define HALFWARP_PER_BLOCK 8
@@ -66,27 +53,11 @@
 #define USE_TENSORCORE 1
 #define USE_COOPERATION 1
 
-// #if TILE_SIZE_M <= 256
-//     #define TILE_PER_WARP (16 * 16 / TILE_SIZE_M) // should not be larger than WARPSIZE
-// #else
-//     #define TILE_PER_WARP 1
-// #endif
-
 #define TILE_PER_WARP 16
-
-// #if TILE_SIZE_M <= 128
-//     #define TILE_PER_HALFWARP (8 * 16 / TILE_SIZE_M) // should not be larger than HALFWARP_SIZE
-// #else
-//     #define TILE_PER_HALFWARP 1
-// #endif
-
 #define TILE_PER_HALFWARP 8
-
 #define TILE_PER_QUADWARP 4
-
 #define TILE_PER_ADAPTIVE_WARP 8
 
-// #define VECTORIZE_NNZA_OR_NNZB_TH (8 * TILE_SIZE_M * TILE_SIZE_N / 16 / 16) 
 #define VECTORIZE_NNZA_OR_NNZB_TH 8
 
 #define SMEM_INTERSECTION_TH 16
@@ -144,11 +115,6 @@
 
 #define HASH_SCALE 107
 
-// #define SMEM_TNY_TH 32
-// #define SMEM_SML_TH 32
-// #define SMEM_LRG_TH 224
-// #define SMEM_DNS_TH (TILE_SIZE_M * TILE_SIZE_M)
-
 #define SMEM_TNY_TH (TILE_SIZE_M * TILE_SIZE_M / 8)
 #define SMEM_SML_TH (TILE_SIZE_M * TILE_SIZE_M / 8)
 
@@ -163,9 +129,6 @@
 #define THREADS_USED_LRG_TH 32
 #define THREADS_USED_DNS_TH 32
 
-// MAGIC_NUMBER should be a prime
-#define MAGIC_NUMBER 13
-
 #define STEP3_THREADS 128
 #define STEP4_THREADS 128
 #if TILE_SIZE_M == 32 && TILE_SIZE_N == 32
@@ -174,7 +137,6 @@
     #define STEP4_TC_THREADS 128
 #endif
 
-// ---------------------- Tile 类型定义 ----------------------
 #if TILE_SIZE_M * TILE_SIZE_N <= 256 && TILE_SIZE_M * TILE_SIZE_M <= 256
     typedef uint8_t TILE_CSR_PTR_TYPE;
 #elif TILE_SIZE_M * TILE_SIZE_N <= 65536 && TILE_SIZE_M * TILE_SIZE_M <= 65536
@@ -228,30 +190,10 @@ typedef uint32_t INTERSEC_BITMASK_TYPE;
 #define TILE_DENSE_THRESHOLD 7
 #endif
 
-// ==================== Dense Tile Optimization Configuration ====================
-
-// Enable slot lock mechanism for dynamic slot allocation
-// When disabled, each warp uses its dedicated slot (no contention, but limited slots)
-// When enabled, warps can acquire/release slots dynamically (more flexible, but has lock overhead)
-#ifndef ENABLE_SLOT_LOCK
-#define ENABLE_SLOT_LOCK 0
-#endif
-
-// ==================== Multi-Warp Shared Slot Configuration ====================
-// Multiple warps share a single slot pool for dense tile storage
-// This reduces shared memory usage when online dense conversion is sparse
-
-// Enable multi-warp shared slot mode
-// When enabled, multiple warps share a pool of slots instead of having dedicated slots
 #ifndef ENABLE_MULTI_WARP_SHARED_SLOT
 #define ENABLE_MULTI_WARP_SHARED_SLOT 1
 #endif
 
-// Number of shared slots in the pool
-// Each slot contains both A and B tile storage with a unified lock
-// Recommended values: 1-4 depending on shared memory budget
-// For TILE_SIZE_M=32, double precision: each slot ~ 16KB (A:8KB + B:8KB)
-// IMPORTANT: For large tiles (TILE_SIZE_M >= 32), use 1 slot to fit in 48KB shared memory
 #ifndef NUM_SHARED_SLOTS
     #if TILE_SIZE_M < 32 && TILE_SIZE_N < 32
         #define NUM_SHARED_SLOTS 2
@@ -260,44 +202,21 @@ typedef uint32_t INTERSEC_BITMASK_TYPE;
     #endif
 #endif
 
-// Spin wait limit for slot acquisition (to prevent infinite loops)
 #ifndef SLOT_SPIN_LIMIT
 #define SLOT_SPIN_LIMIT 0
 #endif
 
-// Enable tile caching in shared slots
-// When enabled, slots remember which tile they contain and can be reused
 #ifndef ENABLE_SLOT_TILE_CACHE
 #define ENABLE_SLOT_TILE_CACHE 1
 #endif
 
-// ==================== End Multi-Warp Shared Slot Configuration ====================
-
-// Sub-tile K dimension step size for Tensor Core computation
-// Smaller values = more fine-grained parallelism but more kernel launch overhead
-// Must be divisible by WMMA_K (4 for FP64)
 #ifndef SUBTILE_K_STEP
 #define SUBTILE_K_STEP TILE_SIZE_N  // Default: process entire K dimension at once
 #endif
 
-// Maximum shared memory per block (in bytes)
-// A100: 164KB per SM, but per-block limit is typically 48KB-96KB dynamic + 48KB static
 #ifndef MAX_SMEM_PER_BLOCK
-#define MAX_SMEM_PER_BLOCK (48 * 1024)  // 48KB default
+#define MAX_SMEM_PER_BLOCK (48 * 1024)
 #endif
-
-// Enable automatic sub-tile splitting when shared memory is insufficient
-#ifndef ENABLE_AUTO_SUBTILE_SPLIT
-#define ENABLE_AUTO_SUBTILE_SPLIT 1
-#endif
-
-// ==================== End Dense Tile Optimization Configuration ====================
-
-// How to use shared mem
-#define TILE_ELEMS_A (TILE_SIZE_M * TILE_SIZE_N)
-#define TILE_ELEMS_B (TILE_SIZE_N * TILE_SIZE_M)
-#define TILE_ELEMS_C (TILE_SIZE_M * TILE_SIZE_M)
-#define STEP4_SMEM_BYTES_PER_WARP ( (size_t)(TILE_ELEMS_A + TILE_ELEMS_B + TILE_ELEMS_C) * sizeof(MAT_VAL_TYPE) )
 
 #ifndef SMATRIX
 #define SMATRIX
