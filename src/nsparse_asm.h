@@ -91,6 +91,10 @@ __device__ __inline__ T ld_gbl_auto(const T *col)
     else if constexpr (std::is_same_v<T, int64_t>) {
         asm("ld.global.cv.s64 %0, [%1];" : "=l"(return_value) : "l"(col));
     }
+    else if constexpr (std::is_same_v<T, half>) {
+        // asm("ld.global.cv.f16 %0, [%1];" : "=h"(return_value) : "l"(col));
+        return __half(*col);
+    }
     else if constexpr (std::is_same_v<T, float>) {
         asm("ld.global.cv.f32 %0, [%1];" : "=f"(return_value) : "l"(col));
     }

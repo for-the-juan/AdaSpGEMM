@@ -2658,6 +2658,8 @@ __device__ __forceinline__ int acquire_shared_slot_spin(int *slot_locks, int num
     return -1;  // Timeout
 }
 
+#if USE_TENSORCORE == 1
+
 __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
                                                                     const int *__restrict__ d_blkcolidxA,
                                                                     int *d_nnzb_A,
@@ -2791,6 +2793,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
 
     if (matchedcnt <= SPECULATIVE_INTERSECTION && specres == 0)
     {
+        // TODO: ???
         const int NUM_SUBTILES = TILE_SIZE_M / 8;
         wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE, wmma::row_major> b_frag;
@@ -3315,6 +3318,8 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_tensor_core_no_slot(int *d_blk
         }
     }
 }
+
+#endif
 
 void tilespgemm(SMatrixA *matrixA,
                 SMatrixB *matrixB,

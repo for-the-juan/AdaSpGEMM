@@ -15,7 +15,7 @@
 #include <omp.h>
 
 #include <sys/time.h>
-#include "cuda_fp16.h"
+#include <cuda_fp16.h>
 
 #include "utils.h"
 
@@ -37,9 +37,9 @@
 #endif
 
 // WMMA fragment dimensions for Double Precision (FP64)
-#define WMMA_M 8
-#define WMMA_N 8
-#define WMMA_K 4
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
 
 #define QUADWARP_SIZE 8
 #define HALFWARP_SIZE 16
