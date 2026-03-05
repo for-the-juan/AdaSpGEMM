@@ -2742,10 +2742,13 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
     int *s_matchedcnt_local = &s_matchedcnt[local_warp_id];
     int *s_acquired_slot = &acquired_slot[local_warp_id];
 
-#pragma unroll
-    for (int i = 0; i < num_warps_per_block; i++){
-        s_acquired_slot[i] = -1;
+    // Initialize acquired_slot array (only lane_id == 0 to avoid race condition)
+    if (lane_id == 0) {
+        for (int i = 0; i < num_warps_per_block; i++){
+            s_acquired_slot[i] = -1;
+        }
     }
+    __syncwarp();
 
     // Initialize C accumulator
 #pragma unroll
@@ -2794,7 +2797,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
     if (matchedcnt <= SPECULATIVE_INTERSECTION && specres == 0)
     {
         // TODO: ???
-        const int NUM_SUBTILES = TILE_SIZE_M / 8;
+        const int NUM_SUBTILES = (TILE_SIZE_M + WMMA_M - 1) / WMMA_M;
         wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE, wmma::row_major> b_frag;
         wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE> c_frag[NUM_SUBTILES + 1][NUM_SUBTILES + 1];
@@ -2918,7 +2921,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
         for(int i=0; i<NUM_SUBTILES; i++) {
 #pragma unroll
             for(int j=0; j<NUM_SUBTILES; j++) {
-                MAT_VAL_TYPE *dst_ptr = s_blkcsr_Val_C_local + (i * sizeof(MAT_VAL_TYPE) * TILE_SIZE_M) + (j * sizeof(MAT_VAL_TYPE));
+                MAT_VAL_TYPE *dst_ptr = s_blkcsr_Val_C_local + (i * WMMA_M * TILE_SIZE_M) + (j * WMMA_N);
                 wmma::store_matrix_sync(dst_ptr, c_frag[i][j], TILE_SIZE_M, wmma::mem_row_major);
             }
         }
@@ -3148,7 +3151,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_tensor_core_no_slot(int *d_blk
 
     if (matchedcnt <= SPECULATIVE_INTERSECTION && specres == 0)
     {
-        const int NUM_SUBTILES = TILE_SIZE_M / 8;
+        const int NUM_SUBTILES = (TILE_SIZE_M + WMMA_M - 1) / WMMA_M;
         wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE, wmma::row_major> b_frag;
         wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, MAT_VAL_TYPE> c_frag[NUM_SUBTILES + 1][NUM_SUBTILES + 1];
@@ -3192,7 +3195,7 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_tensor_core_no_slot(int *d_blk
         for(int i=0; i<NUM_SUBTILES; i++) {
 #pragma unroll
             for(int j=0; j<NUM_SUBTILES; j++) {
-                MAT_VAL_TYPE *dst_ptr = s_blkcsr_Val_C_local + (i * sizeof(MAT_VAL_TYPE) * TILE_SIZE_M) + (j * sizeof(MAT_VAL_TYPE));
+                MAT_VAL_TYPE *dst_ptr = s_blkcsr_Val_C_local + (i * WMMA_M * TILE_SIZE_M) + (j * WMMA_N);
                 wmma::store_matrix_sync(dst_ptr, c_frag[i][j], TILE_SIZE_M, wmma::mem_row_major);
             }
         }
