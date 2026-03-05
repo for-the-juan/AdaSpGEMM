@@ -18,21 +18,21 @@ int spgemm_cusparse_executor(cusparseHandle_t handle, cusparseSpMatDescr_t matA,
                              const int nnzA,
                              const int *d_csrRowPtrA,
                              const int *d_csrColIdxA,
-                             const VALUE_TYPE *d_csrValA,
+                             const double *d_csrValA,
                              cusparseSpMatDescr_t matB,
                              const int mB,
                              const int nB,
                              const int nnzB,
                              const int *d_csrRowPtrB,
                              const int *d_csrColIdxB,
-                             const VALUE_TYPE *d_csrValB,
+                             const double *d_csrValB,
                              cusparseSpMatDescr_t matC,
                              const int mC,
                              const int nC,
                              unsigned long long int *nnzC,
                              int **d_csrRowPtrC,
                              int **d_csrColIdxC,
-                             VALUE_TYPE **d_csrValC)
+                             double **d_csrValC)
 {
     cusparseOperation_t opA = CUSPARSE_OPERATION_NON_TRANSPOSE;
     cusparseOperation_t opB = CUSPARSE_OPERATION_NON_TRANSPOSE;
@@ -80,7 +80,7 @@ int spgemm_cusparse_executor(cusparseHandle_t handle, cusparseSpMatDescr_t matA,
     cusparseSpMatGetSize(matC, &C_num_rows1, &C_num_cols1, &C_num_nnz1);
     // allocate matrix C
     cudaMalloc((void **)d_csrColIdxC, C_num_nnz1 * sizeof(int));
-    cudaMalloc((void **)d_csrValC, C_num_nnz1 * sizeof(VALUE_TYPE));
+    cudaMalloc((void **)d_csrValC, C_num_nnz1 * sizeof(double));
     // update matC with the new pointers
     cusparseCsrSetPointers(matC, *d_csrRowPtrC, *d_csrColIdxC, *d_csrValC);
 
@@ -101,19 +101,19 @@ int spgemm_cusparse(const int mA,
                     const int nnzA,
                     const int *h_csrRowPtrA,
                     const int *h_csrColIdxA,
-                    const VALUE_TYPE *h_csrValA,
+                    const double *h_csrValA,
                     const int mB,
                     const int nB,
                     const int nnzB,
                     const int *h_csrRowPtrB,
                     const int *h_csrColIdxB,
-                    const VALUE_TYPE *h_csrValB,
+                    const double *h_csrValB,
                     const int mC,
                     const int nC,
                     const int nnzC_golden,
                     const int *h_csrRowPtrC_golden,
                     const int *h_csrColIdxC_golden,
-                    const VALUE_TYPE *h_csrValC_golden,
+                    const double *h_csrValC_golden,
                     const bool check_result,
                     unsigned long long int nnzCub,
                     unsigned long long int *nnzC,
@@ -125,32 +125,32 @@ int spgemm_cusparse(const int mA,
     // transfer host mem to device mem
     int *d_csrRowPtrA;
     int *d_csrColIdxA;
-    VALUE_TYPE *d_csrValA;
+    double *d_csrValA;
     int *d_csrRowPtrB;
     int *d_csrColIdxB;
-    VALUE_TYPE *d_csrValB;
+    double *d_csrValB;
     //unsigned long long int nnzC = 0;
     int *d_csrRowPtrC;
     int *d_csrColIdxC;
-    VALUE_TYPE *d_csrValC;
+    double *d_csrValC;
 
     // Matrix A in CSR
     cudaMalloc((void **)&d_csrRowPtrA, (mA + 1) * sizeof(int));
     cudaMalloc((void **)&d_csrColIdxA, nnzA * sizeof(int));
-    cudaMalloc((void **)&d_csrValA, nnzA * sizeof(VALUE_TYPE));
+    cudaMalloc((void **)&d_csrValA, nnzA * sizeof(double));
 
     cudaMemcpy(d_csrRowPtrA, h_csrRowPtrA, (mA + 1) * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_csrColIdxA, h_csrColIdxA, nnzA * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_csrValA, h_csrValA, nnzA * sizeof(VALUE_TYPE), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_csrValA, h_csrValA, nnzA * sizeof(double), cudaMemcpyHostToDevice);
 
     // Matrix B in CSR
     cudaMalloc((void **)&d_csrRowPtrB, (mB + 1) * sizeof(int));
     cudaMalloc((void **)&d_csrColIdxB, nnzB * sizeof(int));
-    cudaMalloc((void **)&d_csrValB, nnzB * sizeof(VALUE_TYPE));
+    cudaMalloc((void **)&d_csrValB, nnzB * sizeof(double));
 
     cudaMemcpy(d_csrRowPtrB, h_csrRowPtrB, (mB + 1) * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_csrColIdxB, h_csrColIdxB, nnzB * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_csrValB, h_csrValB, nnzB * sizeof(VALUE_TYPE), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_csrValB, h_csrValB, nnzB * sizeof(double), cudaMemcpyHostToDevice);
 
     //--------------------------------------------------------------------------
     // CUSPARSE APIs
@@ -240,11 +240,11 @@ int spgemm_cusparse(const int mA,
 
             int *h_csrRowPtrC = (int *)malloc((mC + 1) * sizeof(int));
             int *h_csrColIdxC = (int *)malloc(*nnzC * sizeof(int));
-            VALUE_TYPE *h_csrValC = (VALUE_TYPE *)malloc(*nnzC * sizeof(VALUE_TYPE));
+            double *h_csrValC = (double *)malloc(*nnzC * sizeof(double));
 
             cudaMemcpy(h_csrRowPtrC, d_csrRowPtrC, (mC + 1) * sizeof(int), cudaMemcpyDeviceToHost);
             cudaMemcpy(h_csrColIdxC, d_csrColIdxC, *nnzC * sizeof(int), cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_csrValC, d_csrValC, *nnzC * sizeof(VALUE_TYPE), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_csrValC, d_csrValC, *nnzC * sizeof(double), cudaMemcpyDeviceToHost);
 
             int errcounter = 0;
             for (int i = 0; i < mC + 1; i++)

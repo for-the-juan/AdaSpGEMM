@@ -340,11 +340,32 @@ tile2csr(matrixC, TILE_SIZE_M, TILE_SIZE_M);
     int *csrColIdxC_golden = matrixC->columnindex;
     MAT_VAL_TYPE *csrValC_golden = matrixC->value;
 
-    spgemm_cu(matrixA->m, matrixA->n, matrixA->nnz, matrixA->rowpointer, matrixA->columnindex, matrixA->value,
-              matrixB->m, matrixB->n, matrixB->nnz, matrixB->rowpointer, matrixB->columnindex, matrixB->value,
-              mC, nC, nnzC_golden, csrRowPtrC_golden, csrColIdxC_golden, csrValC_golden,
+    // Allocate double type value buffers for spgemm_cu
+    matrixA->value_double = (double *)malloc(matrixA->nnz * sizeof(double));
+    matrixB->value_double = (double *)malloc(matrixB->nnz * sizeof(double));
+    double *csrValC_golden_double = (double *)malloc(nnzC_golden * sizeof(double));
+    
+    // Copy and convert data from MAT_VAL_TYPE to double
+    for (int i = 0; i < matrixA->nnz; i++) {
+        matrixA->value_double[i] = (double)matrixA->value[i];
+    }
+    for (int i = 0; i < matrixB->nnz; i++) {
+        matrixB->value_double[i] = (double)matrixB->value[i];
+    }
+    for (int i = 0; i < nnzC_golden; i++) {
+        csrValC_golden_double[i] = (double)csrValC_golden[i];
+    }
+
+    spgemm_cu(matrixA->m, matrixA->n, matrixA->nnz, matrixA->rowpointer, matrixA->columnindex, matrixA->value_double,
+              matrixB->m, matrixB->n, matrixB->nnz, matrixB->rowpointer, matrixB->columnindex, matrixB->value_double,
+              mC, nC, nnzC_golden, csrRowPtrC_golden, csrColIdxC_golden, csrValC_golden_double,
               check_result, nnzCub, &nnzC, &compression_rate1, &time_cusparse, &gflops_cusparse);
     printf("---------------------------------------------------------------\n");
+
+    // Free double type value buffers
+    free(matrixA->value_double);
+    free(matrixB->value_double);
+    free(csrValC_golden_double);
 
 #endif
     matrix_destroy(matrixA);

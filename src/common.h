@@ -227,6 +227,7 @@ typedef struct
     int nnz;
     int isSymmetric;
     MAT_VAL_TYPE *value;
+    double *value_double;  // double type value pointer for spgemm_cu
     int *columnindex;
     MAT_PTR_TYPE *rowpointer;
     int tilem;
@@ -255,6 +256,7 @@ typedef struct
     int nnz;
     int isSymmetric;
     MAT_VAL_TYPE *value;
+    double *value_double;  // double type value pointer for spgemm_cu
     int *columnindex;
     MAT_PTR_TYPE *rowpointer;
     int tilem;
