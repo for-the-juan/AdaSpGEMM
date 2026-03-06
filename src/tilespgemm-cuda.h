@@ -2740,10 +2740,14 @@ __global__ void tile_spgemm_step4_cuda_dns_kernel_shared_slot(int *d_blkrowptrA,
     int *s_matchedcnt_local = &s_matchedcnt[local_warp_id];
     int *s_acquired_slot = &acquired_slot[local_warp_id];
 
+    if (!lane_id){
 #pragma unroll
-    for (int i = 0; i < num_warps_per_block; i++){
-        s_acquired_slot[i] = -1;
+        for (int i = 0; i < num_warps_per_block; i++){
+            s_acquired_slot[i] = -1;
+        }
     }
+
+    __syncwarp();
 
     // Initialize C accumulator
 #pragma unroll
